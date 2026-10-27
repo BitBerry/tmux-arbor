@@ -27,6 +27,29 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
+    exec(Command::new(program()), args)
+}
+
+/// Runs tmux from `cwd`. A detached client's own directory is where a new
+/// pane without -c starts, so this makes it start where an attached client
+/// would put it.
+pub fn run_from<I, S>(cwd: &str, args: I) -> Result<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut cmd = Command::new(program());
+    if std::path::Path::new(cwd).is_dir() {
+        cmd.current_dir(cwd);
+    }
+    exec(cmd, args)
+}
+
+fn exec<I, S>(mut cmd: Command, args: I) -> Result<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
     let args: Vec<String> = args
         .into_iter()
         .map(|a| {
@@ -34,12 +57,7 @@ where
             if a == ";" { a.to_string() } else { escape(a) }
         })
         .collect();
-    let out = Command::new(program())
-        .args(&args)
-        .stdin(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()
-        .context("cannot run tmux")?;
+    let out = cmd.args(&args).stdin(Stdio::null()).stderr(Stdio::piped()).output().context("cannot run tmux")?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
         bail!("tmux {}: {}", args.first().map(String::as_str).unwrap_or(""), err.trim());

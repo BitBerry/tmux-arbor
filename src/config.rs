@@ -104,6 +104,11 @@ pub struct Config {
     pub status_button: bool,
     pub bin: String,
     pub prefix: String,
+    /// The split buttons under the header.
+    pub buttons: bool,
+    /// The user's keys for split-window -h and -v, read with list-keys.
+    pub split_h_key: String,
+    pub split_v_key: String,
 }
 
 impl Default for Config {
@@ -125,11 +130,14 @@ impl Default for Config {
             status_button: true,
             bin: String::new(),
             prefix: "C-b".into(),
+            buttons: true,
+            split_h_key: String::new(),
+            split_v_key: String::new(),
         }
     }
 }
 
-const KEYS: [&str; 16] = [
+const KEYS: [&str; 19] = [
     "@arbor-mode",
     "@arbor-last-mode",
     "@arbor-width",
@@ -146,6 +154,9 @@ const KEYS: [&str; 16] = [
     "@arbor-status-button",
     "@arbor-bin",
     "prefix",
+    "@arbor-buttons",
+    "@arbor-split-h-key",
+    "@arbor-split-v-key",
 ];
 
 fn flag(s: &str, default: bool) -> bool {
@@ -196,6 +207,9 @@ impl Config {
             status_button: flag(get(13), true),
             bin: get(14).to_string(),
             prefix: if get(15).is_empty() { d.prefix } else { get(15).to_string() },
+            buttons: flag(get(16), true),
+            split_h_key: get(17).to_string(),
+            split_v_key: get(18).to_string(),
         }
     }
 

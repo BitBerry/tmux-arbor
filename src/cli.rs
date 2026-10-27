@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 
 use crate::config::{Config, MAX_W, MIN_FULL, Mode, Side};
+use crate::split;
 use crate::status;
 use crate::tmux::{self, Batch, SEP, shell_quote};
 
@@ -54,6 +55,7 @@ const USAGE: &str = "usage: arbor <command>
   rail                 switch between rail and full
   resize <+N|-N|N|reset>
   flip                 move the sidebar to the other side
+  split <h|v> <pane>   split the work pane next to a sidebar
   sync                 open sidebars where clients are looking
   notify               redraw every sidebar
   uninstall            remove sidebars, bindings and hooks
@@ -82,6 +84,7 @@ pub fn run(args: &[String]) -> Result<()> {
         Some("notify") => notify(libc::SIGUSR1),
         Some("hook") => hook(arg(1).unwrap_or(""), arg(2)),
         Some("border-dblclick") => border_dblclick(arg(1)),
+        Some("split") => split::run(arg(1), arg(2)),
         Some("uninstall") => uninstall(),
         Some("version" | "--version" | "-V") => {
             println!("arbor {}", env!("CARGO_PKG_VERSION"));
@@ -188,7 +191,7 @@ fn sidebars(rows: &[PaneRow]) -> impl Iterator<Item = &PaneRow> {
 }
 
 /// The work pane a sidebar should split from or hand focus to.
-fn work_pane<'a>(rows: &'a [PaneRow], window: &str) -> Option<&'a PaneRow> {
+pub fn work_pane<'a>(rows: &'a [PaneRow], window: &str) -> Option<&'a PaneRow> {
     let work = || rows.iter().filter(move |r| r.window == window && !r.sidebar);
     work().find(|r| r.active).or_else(|| work().find(|r| r.last)).or_else(|| work().next())
 }
@@ -599,6 +602,9 @@ fn init() -> Result<()> {
         }
     }
 
+    // The user's split keys must split the work pane, not the tree.
+    split::install(&bin)?;
+
     // Focusing the tree must not rename the window to "arbor".
     let rename = get("automatic-rename-format");
     if !rename.contains("@arbor-sidebar") {
@@ -693,6 +699,7 @@ fn uninstall() -> Result<()> {
         let _ = kill.run();
     }
     status::restore()?;
+    split::uninstall()?;
     let rename = get("@arbor-orig-rename-format");
     if !rename.is_empty() {
         tmux::set_global("automatic-rename-format", &rename)?;

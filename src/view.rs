@@ -2,10 +2,12 @@
 //! (branches, blocks, map) or as the 7-column rail, plus the header and
 //! footer around the list.
 
+use std::cell::Cell;
+use std::time::Duration;
+
 use crate::config::{MAP_MIN, Variant};
-use crate::label::Label;
 use crate::model::{NodeKey, PaneInfo, Snapshot, Win, expanded};
-use crate::screen::{BOLD, Canvas, Color, DIM, OVERLINE, Style, UNDER_DASHED, UNDERLINE, truncate, width};
+use crate::screen::{BOLD, Canvas, Color, DIM, OVERLINE, Style, UNDER_DASHED, UNDERLINE, skip_width, truncate, width};
 use crate::strings::Strings;
 use crate::theme::Palette;
 
@@ -20,6 +22,8 @@ pub enum Hit {
         pid: String,
     },
     NewWindow,
+    /// A split button: 'h' or 'v'.
+    Split(char),
 }
 
 impl Hit {
@@ -60,7 +64,13 @@ pub struct Ctx<'a> {
     /// Only set while the sidebar holds the keyboard.
     pub cursor: Option<&'a NodeKey>,
     pub hover: Option<&'a NodeKey>,
+    /// The split button under the pointer.
+    pub hover_split: Option<char>,
     pub drag: Option<&'a Drag>,
+    /// The node whose cut-off text is scrolling, and for how long.
+    pub marquee: Option<(&'a NodeKey, Duration)>,
+    /// Set while drawing: how many columns the marquee text overflows by.
+    pub overflow: Cell<Option<u16>>,
 }
 
 #[derive(Clone, Debug)]
@@ -161,6 +171,18 @@ impl Ctx<'_> {
         look
     }
 
+    /// Columns to scroll `key`'s text by, when it is the marquee and its
+    /// `total` columns do not fit in `avail`.
+    fn scroll(&self, key: &NodeKey, total: usize, avail: usize) -> Option<usize> {
+        let (k, elapsed) = self.marquee?;
+        if k != key || total <= avail {
+            return None;
+        }
+        let dist = total - avail;
+        self.overflow.set(Some(dist as u16));
+        Some(marquee_offset(dist, elapsed))
+    }
+
     fn chevron(&self, w: &Win) -> &'static str {
         if self.rail || w.panes.len() < 2 {
             " "
@@ -172,11 +194,59 @@ impl Ctx<'_> {
     }
 }
 
-/// Writes a label from `x`, cut with "…" so it ends before `limit`.
-fn put_label(c: &mut Canvas<Hit>, x: u16, y: u16, limit: u16, label: &Label, look: &Look) -> u16 {
-    let spans = if look.plain { vec![(label.plain(), look.base)] } else { label.spans(look.base) };
+/// Hover marquee timing, after the design: hold at each end, then glide
+/// about 28ms per pixel (a column is roughly 8px), easing in and out.
+const MARQUEE_HOLD: f64 = 700.0;
+const MARQUEE_COL: f64 = 218.0;
+
+fn marquee_travel(dist: usize) -> f64 {
+    (dist as f64 * MARQUEE_COL).max(700.0)
+}
+
+/// One full cycle: out, hold, back, hold.
+pub fn marquee_cycle(dist: u16) -> Duration {
+    Duration::from_millis((2.0 * (marquee_travel(dist as usize) + 2.0 * MARQUEE_HOLD)) as u64)
+}
+
+/// Columns scrolled `elapsed` into a back-and-forth marquee over `dist`.
+pub fn marquee_offset(dist: usize, elapsed: Duration) -> usize {
+    let travel = marquee_travel(dist);
+    let pass = travel + 2.0 * MARQUEE_HOLD;
+    let t = elapsed.as_secs_f64() * 1000.0 % (2.0 * pass);
+    let t = if t > pass { 2.0 * pass - t } else { t };
+    let p = ((t - MARQUEE_HOLD) / travel).clamp(0.0, 1.0);
+    let eased = if p < 0.5 { 4.0 * p * p * p } else { 1.0 - (-2.0 * p + 2.0).powi(3) / 2.0 };
+    (eased * dist as f64).round() as usize
+}
+
+/// Writes `spans` from `x` with their first `skip` columns scrolled away,
+/// clipped at `limit`.
+fn put_scrolled(c: &mut Canvas<Hit>, x: u16, y: u16, spans: &[(String, Style)], skip: usize, limit: u16) -> u16 {
+    let mut x = x;
+    let mut skip = skip;
+    for (s, st) in spans {
+        let w = width(s);
+        if skip >= w {
+            skip -= w;
+            continue;
+        }
+        let (pad, rest) = skip_width(s, skip);
+        skip = 0;
+        x = c.put(x, y, &" ".repeat(pad), *st, limit);
+        x = c.put(x, y, rest, *st, limit);
+    }
+    x
+}
+
+/// Writes a window's label from `x`, cut with "…" so it ends before
+/// `limit`, or scrolling when it is the marquee.
+fn put_label(c: &mut Canvas<Hit>, ctx: &Ctx, w: &Win, x: u16, y: u16, limit: u16, look: &Look) -> u16 {
+    let spans = if look.plain { vec![(w.label.plain(), look.base)] } else { w.label.spans(look.base) };
     let avail = limit.saturating_sub(x) as usize;
     let total: usize = spans.iter().map(|(s, _)| width(s)).sum();
+    if let Some(skip) = ctx.scroll(&NodeKey::Window(w.id.clone()), total, avail) {
+        return put_scrolled(c, x, y, &spans, skip, limit);
+    }
     let mut x = x;
     if total <= avail {
         for (s, st) in &spans {
@@ -203,6 +273,15 @@ fn put_label(c: &mut Canvas<Hit>, x: u16, y: u16, limit: u16, label: &Label, loo
 
 fn put_text(c: &mut Canvas<Hit>, x: u16, y: u16, s: &str, style: Style, limit: u16) -> u16 {
     c.put(x, y, &truncate(s, limit.saturating_sub(x) as usize), style, limit)
+}
+
+/// A pane's command: cut with "…", or scrolling when it is the marquee.
+fn put_cmd(c: &mut Canvas<Hit>, ctx: &Ctx, pane: &PaneInfo, x: u16, y: u16, style: Style, limit: u16) -> u16 {
+    let key = NodeKey::Pane(pane.id.clone());
+    match ctx.scroll(&key, width(&pane.cmd), limit.saturating_sub(x) as usize) {
+        Some(skip) => put_scrolled(c, x, y, &[(pane.cmd.clone(), style)], skip, limit),
+        None => put_text(c, x, y, &pane.cmd, style, limit),
+    }
 }
 
 fn win_height(ctx: &Ctx, variant: Variant, w: &Win) -> u16 {
@@ -291,7 +370,7 @@ fn draw_branches(c: &mut Canvas<Hit>, y0: u16, ctx: &Ctx, w: &Win, last: bool, n
     c.put(0, y0, if last { " └─" } else { " ├─" }, guide, full);
     c.fill(3, end, y0, look.base);
     c.put(4, y0, ctx.chevron(w), look.base.fg(look.sub), end);
-    put_label(c, 6, y0, end.saturating_sub(1), &w.label, &look);
+    put_label(c, ctx, w, 6, y0, end.saturating_sub(1), &look);
     c.set_hit(0, full, y0, &Hit::Window(w.id.clone()));
     if w.panes.len() > 1 {
         c.set_hit(3, 6, y0, &Hit::Chevron(w.id.clone()));
@@ -309,7 +388,7 @@ fn draw_branches(c: &mut Canvas<Hit>, y0: u16, ctx: &Ctx, w: &Win, last: bool, n
         c.fill(6, end, y, look.base);
         let num = (i + 1).to_string();
         let x = c.put(7, y, &num, look.base.fg(look.num), end);
-        put_text(c, x.max(8) + 1, y, &pane.cmd, look.base, end.saturating_sub(1));
+        put_cmd(c, ctx, pane, x.max(8) + 1, y, look.base, end.saturating_sub(1));
         c.set_hit(0, full, y, &Hit::Pane { wid: w.id.clone(), pid: pane.id.clone() });
         nodes.push((NodeKey::Pane(pane.id.clone()), y, y));
     }
@@ -365,7 +444,7 @@ fn draw_blocks(c: &mut Canvas<Hit>, y0: u16, ctx: &Ctx, w: &Win, nodes: &mut Vec
     }
     let title_end = x1.saturating_sub(3);
     let x = c.put(x0 + 1, y0, " ", look.base, title_end);
-    let x = put_label(c, x, y0, title_end.saturating_sub(1), &w.label, &look);
+    let x = put_label(c, ctx, w, x, y0, title_end.saturating_sub(1), &look);
     c.put(x, y0, " ", look.base, title_end);
     if w.panes.len() > 1 {
         c.put(
@@ -396,7 +475,7 @@ fn draw_blocks(c: &mut Canvas<Hit>, y0: u16, ctx: &Ctx, w: &Win, nodes: &mut Vec
         c.put(x0 + 2, y, if pane.active { "■" } else { "□" }, look.base.fg(dot_color), x1);
         let num = (i + 1).to_string();
         let x = c.put(x0 + 4, y, &num, look.base.fg(look.num), x1);
-        put_text(c, x + 1, y, &pane.cmd, look.base, x1.saturating_sub(1));
+        put_cmd(c, ctx, pane, x + 1, y, look.base, x1.saturating_sub(1));
         c.set_hit(0, full, y, &Hit::Pane { wid: w.id.clone(), pid: pane.id.clone() });
         nodes.push((pkey, y, y));
     }
@@ -450,8 +529,12 @@ fn map_geom(w: &Win, cw: u16) -> Option<MapGeom> {
     let (xs, ys) = (distinct(&xe), distinct(&ye));
     let span_x = cw - 1;
     let px = scale_edges(&xs, tw, span_x, 2, true);
-    // Character cells are about twice as tall as wide; halve the height.
-    let span_y = (span_x as f64 * th as f64 / tw as f64 * 0.5).round().clamp(2.0, 8.0) as u16;
+    // As short as the design's map: the smallest pane gets one text row,
+    // the rest in proportion, six rows at most. tmux never splits exactly in
+    // half (a border takes a row), hence the slack.
+    let min_h = w.panes.iter().map(|p| p.height).min()?.max(1) as f64;
+    let rows = (th.saturating_sub(1) as f64 / min_h - 0.15).ceil().clamp(1.0, 6.0) as u16;
+    let span_y = rows + ys.len() as u16 - 1;
     let py = scale_edges(&ys, th, span_y, 2, false);
     let at = |edges: &[u32], pos: &[u16], e: u32| edges.binary_search(&e).map(|i| pos[i]).unwrap_or(0);
     let rects = xe
@@ -491,7 +574,7 @@ fn draw_map(c: &mut Canvas<Hit>, y0: u16, ctx: &Ctx, w: &Win, nodes: &mut Vec<(N
     let look = ctx.win_look(w);
     c.fill(1, end, y0, look.base);
     let chev = end.saturating_sub(2);
-    put_label(c, 2, y0, chev.saturating_sub(1), &w.label, &look);
+    put_label(c, ctx, w, 2, y0, chev.saturating_sub(1), &look);
     c.set_hit(0, full, y0, &Hit::Window(w.id.clone()));
     if w.panes.len() > 1 {
         c.put(chev, y0, ctx.chevron(w), look.base.fg(look.sub), end);
@@ -551,7 +634,7 @@ fn draw_map(c: &mut Canvas<Hit>, y0: u16, ctx: &Ctx, w: &Win, nodes: &mut Vec<(N
         if y1 > y0r + 1 && x1 > x0 + 1 {
             let limit = ox + x1;
             let x = c.put(ox + x0 + 1, oy + y0r + 1, &(i + 1).to_string(), look.base.fg(look.num).with(BOLD), limit);
-            put_text(c, x + 1, oy + y0r + 1, &pane.cmd, look.base, limit);
+            put_cmd(c, ctx, pane, x + 1, oy + y0r + 1, look.base, limit);
         }
         nodes.push((NodeKey::Pane(pane.id.clone()), oy + y0r, oy + y1));
     }
@@ -604,8 +687,9 @@ fn draw_rail(c: &mut Canvas<Hit>, y: u16, ctx: &Ctx, w: &Win, nodes: &mut Vec<(N
     nodes.push((NodeKey::Window(w.id.clone()), y, y));
 }
 
-/// Session name, window count and the TREE badge, over a rule. Two rows.
-pub fn header(c: &mut Canvas<Hit>, ctx: &Ctx, focused: bool, text: &Strings) -> u16 {
+/// Session name, window count and the TREE badge; the split buttons when
+/// `toolbar`; then a rule. Returns the rows used.
+pub fn header(c: &mut Canvas<Hit>, ctx: &Ctx, focused: bool, toolbar: bool, text: &Strings) -> u16 {
     let p = ctx.pal;
     let full = c.w;
     let name = &ctx.snap.session_name;
@@ -633,11 +717,63 @@ pub fn header(c: &mut Canvas<Hit>, ctx: &Ctx, focused: bool, text: &Strings) -> 
             c.put(bx, 0, badge, Style::default().bg(p.cursor_bg).fg(p.cursor_fg).with(BOLD), full);
         }
     }
+    let mut y = 1;
+    if toolbar && !ctx.rail {
+        buttons(c, y, ctx, text);
+        y += 1;
+    }
     let rule = ctx.plain().fg(p.divider);
     for x in 0..full {
-        c.put(x, 1, "─", rule, full);
+        c.put(x, y, "─", rule, full);
     }
-    2
+    y + 1
+}
+
+/// The design's split buttons: an icon, a label and the user's own key for
+/// split-window -h and -v. Narrow sidebars drop the icon, then the label.
+fn buttons(c: &mut Canvas<Hit>, y: u16, ctx: &Ctx, text: &Strings) {
+    let p = ctx.pal;
+    let cfg = &ctx.snap.cfg;
+    let items =
+        [('h', "◫", text.split_h(), cfg.split_h_key.as_str()), ('v', "⊟", text.split_v(), cfg.split_v_key.as_str())];
+    // Each chip as (text, is_key) parts, for (icon, label).
+    let parts = |(_, icon, name, key): &(char, &str, String, &str), show: (bool, bool)| {
+        let mut v: Vec<(String, bool)> = Vec::new();
+        if show.0 {
+            v.push((format!(" {icon}"), false));
+        }
+        if show.1 {
+            v.push((format!(" {name}"), false));
+        }
+        if !key.is_empty() {
+            v.push((" ".into(), false));
+            v.push((key.to_string(), true));
+        }
+        v.push((" ".into(), false));
+        v
+    };
+    let room = c.w.saturating_sub(2) as usize;
+    let span =
+        |show| items.iter().map(|i| parts(i, show).iter().map(|(t, _)| width(t)).sum::<usize>()).sum::<usize>() + 1;
+    let show =
+        [(true, true), (false, true), (true, false)].into_iter().find(|&s| span(s) <= room).unwrap_or((true, false));
+    let end = c.w.saturating_sub(1);
+    let mut x = 1;
+    for item in &items {
+        let hot = ctx.hover_split == Some(item.0);
+        let st = if hot {
+            Style::default().bg(p.cur_win_bg).fg(p.cur_win_fg)
+        } else {
+            Style::default().bg(p.hover_bg).fg(p.text)
+        };
+        let x0 = x;
+        for (t, is_key) in parts(item, show) {
+            let style = if is_key { st.fg(if hot { p.cur_win_sub } else { p.muted }) } else { st };
+            x = c.put(x, y, &t, style, end);
+        }
+        c.set_hit(x0, x, y, &Hit::Split(item.0));
+        x += 1;
+    }
 }
 
 /// What the footer shows below the list.
@@ -700,11 +836,25 @@ pub fn footer(c: &mut Canvas<Hit>, y0: u16, ctx: &Ctx, f: &Footer) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::label::Label;
     use crate::model::tests::sample;
     use crate::theme;
 
     fn ctx<'a>(snap: &'a Snapshot, pal: &'a Palette, variant: Variant, width: u16) -> Ctx<'a> {
-        Ctx { snap, pal, width, rail: false, variant, label_styles: true, cursor: None, hover: None, drag: None }
+        Ctx {
+            snap,
+            pal,
+            width,
+            rail: false,
+            variant,
+            label_styles: true,
+            cursor: None,
+            hover: None,
+            hover_split: None,
+            drag: None,
+            marquee: None,
+            overflow: Cell::new(None),
+        }
     }
 
     #[test]
@@ -776,6 +926,76 @@ mod tests {
         let l = list(&c);
         assert_eq!(l.canvas.h, 4);
         assert_eq!(l.canvas.row_text(0), "   1   ");
+    }
+
+    #[test]
+    fn map_is_as_short_as_its_smallest_pane_allows() {
+        let snap = sample();
+        let pal = theme::light();
+        let l = list(&ctx(&snap, &pal, Variant::Map, 28));
+        let rows: Vec<String> = (0..l.canvas.h).map(|y| l.canvas.row_text(y).trim_end().to_string()).collect();
+        // Window row, then five lines: the two right panes get a row each.
+        assert_eq!(
+            rows[1..6],
+            [
+                "  ┌───────────┬───────────┐",
+                "  │1 nvim     │2 zsh      │",
+                "  │           ├───────────┤",
+                "  │           │3 zsh      │",
+                "  └───────────┴───────────┘",
+            ]
+        );
+    }
+
+    #[test]
+    fn split_buttons_show_the_users_keys() {
+        let mut snap = sample();
+        snap.cfg.split_h_key = "%".into();
+        snap.cfg.split_v_key = "\"".into();
+        let pal = theme::light();
+        let text = Strings::new(crate::config::Lang::Zh);
+        let mut c = Canvas::new(28, 4, Style::default());
+        let rows = header(&mut c, &ctx(&snap, &pal, Variant::Branches, 28), false, true, &text);
+        assert_eq!(rows, 3);
+        assert_eq!(c.row_text(1).trim_end(), "  水平分割 %   竖直分割 \"");
+        assert_eq!(c.hit(3, 1), Some(&Hit::Split('h')));
+        assert_eq!(c.hit(18, 1), Some(&Hit::Split('v')));
+        // Wide enough for the icons too.
+        let mut c = Canvas::new(34, 4, Style::default());
+        header(&mut c, &ctx(&snap, &pal, Variant::Branches, 34), false, true, &text);
+        assert_eq!(c.row_text(1).trim_end(), "  ◫ 水平分割 %   ⊟ 竖直分割 \"");
+    }
+
+    #[test]
+    fn marquee_scrolls_a_cut_label() {
+        let mut snap = sample();
+        snap.windows[2].label = Label::parse("3:staging-db-migrations");
+        let pal = theme::light();
+        let key = NodeKey::Window("@3".into());
+        let mut c = ctx(&snap, &pal, Variant::Branches, 20);
+        // Start: held at the beginning, no ellipsis.
+        c.marquee = Some((&key, Duration::ZERO));
+        assert_eq!(list(&c).canvas.row_text(5).trim_end(), " ├─   3:staging-db");
+        assert_eq!(c.overflow.get(), Some(11));
+        // Fully scrolled: the tail shows.
+        c.marquee = Some((&key, Duration::from_millis(700 + 11 * 218 + 10)));
+        assert_eq!(list(&c).canvas.row_text(5).trim_end(), " ├─   b-migrations");
+        // Another node's label is cut as usual.
+        let other = NodeKey::Window("@4".into());
+        c.marquee = Some((&other, Duration::ZERO));
+        c.overflow.set(None);
+        assert_eq!(list(&c).canvas.row_text(5).trim_end(), " ├─   3:staging-d…");
+        assert_eq!(c.overflow.get(), None);
+    }
+
+    #[test]
+    fn marquee_goes_out_and_back() {
+        assert_eq!(marquee_offset(10, Duration::ZERO), 0);
+        assert_eq!(marquee_offset(10, Duration::from_millis(600)), 0);
+        let pass = 700 + 2180 + 700;
+        assert_eq!(marquee_offset(10, Duration::from_millis(pass - 100)), 10);
+        assert_eq!(marquee_offset(10, Duration::from_millis(2 * pass - 100)), 0);
+        assert_eq!(marquee_cycle(10), Duration::from_millis(2 * pass));
     }
 
     #[test]

@@ -287,6 +287,19 @@ pub fn truncate(s: &str, max: usize) -> String {
     out
 }
 
+/// Drops the first `n` columns of `s`. Returns the rest and how many blank
+/// columns stand in for a wide character cut in half.
+pub fn skip_width(s: &str, n: usize) -> (usize, &str) {
+    let mut w = 0;
+    for (i, ch) in s.char_indices() {
+        if w >= n {
+            return (w - n, &s[i..]);
+        }
+        w += ch.width().unwrap_or(0);
+    }
+    (w.saturating_sub(n), "")
+}
+
 /// The longest prefix of `s` that fits in `max` columns.
 pub fn take_width(s: &str, max: usize) -> &str {
     let mut w = 0;
@@ -321,6 +334,14 @@ mod tests {
         assert_eq!(c.put(0, 0, "abcdef", Style::default(), 4), 4);
         assert_eq!(c.row_text(0), "abcd    ");
         assert_eq!(c.put(3, 0, "窗", Style::default(), 4), 3);
+    }
+
+    #[test]
+    fn skipping_columns() {
+        assert_eq!(skip_width("abcdef", 2), (0, "cdef"));
+        assert_eq!(skip_width("窗口ab", 1), (1, "口ab"));
+        assert_eq!(skip_width("窗口ab", 4), (0, "ab"));
+        assert_eq!(skip_width("ab", 5), (0, ""));
     }
 
     #[test]

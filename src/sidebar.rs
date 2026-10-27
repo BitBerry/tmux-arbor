@@ -3,6 +3,7 @@
 //! it (SIGUSR1), re-detects the theme on SIGUSR2, and handles its own
 //! resizes on SIGWINCH.
 
+use std::cell::Cell;
 use std::io::{self, Read};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
@@ -16,6 +17,7 @@ use crate::input::{Event, Key, Mouse, MouseKind, Parser};
 use crate::label::parse_color;
 use crate::model::{NodeKey, Snapshot, expanded, pane_number};
 use crate::screen::Canvas;
+use crate::split;
 use crate::strings::{Strings, wrap};
 use crate::term;
 use crate::theme::{self, Palette};
@@ -28,6 +30,8 @@ const RESIZE_SETTLE: Duration = Duration::from_millis(150);
 const REFRESH_COALESCE: Duration = Duration::from_millis(15);
 const ESC_WAIT: Duration = Duration::from_millis(25);
 const MESSAGE_TIME: Duration = Duration::from_millis(1600);
+/// Frame interval while a marquee scrolls.
+const MARQUEE_FRAME: Duration = Duration::from_millis(80);
 
 struct Signals {
     winch: UnixStream,
@@ -70,6 +74,15 @@ fn drain(mut s: &UnixStream) -> bool {
     any
 }
 
+/// A hovered node whose text is cut off, scrolling to show the rest.
+struct Marquee {
+    key: NodeKey,
+    start: Instant,
+    /// tmux reports no pointer leaving the pane, so a marquee runs one full
+    /// cycle past the last motion and then stops.
+    last_motion: Instant,
+}
+
 struct Press {
     x: u16,
     y: u16,
@@ -96,6 +109,9 @@ struct App {
     parser: Parser,
     cursor: Option<NodeKey>,
     hover: Option<NodeKey>,
+    hover_split: Option<char>,
+    marquee: Option<Marquee>,
+    anim_at: Option<Instant>,
     /// A node to scroll into view on the next frame.
     reveal: Option<NodeKey>,
     scroll: u16,
@@ -149,6 +165,9 @@ impl App {
             parser: Parser::default(),
             cursor: None,
             hover: None,
+            hover_split: None,
+            marquee: None,
+            anim_at: None,
             reveal: None,
             scroll: 0,
             press: None,
@@ -171,10 +190,17 @@ impl App {
     fn run(&mut self, sig: &Signals) -> Result<()> {
         while !self.quit {
             let now = Instant::now();
-            let next = [self.resize_at, self.refresh_at, self.esc_at, self.tick_at, self.msg.as_ref().map(|m| m.1)]
-                .into_iter()
-                .flatten()
-                .min();
+            let next = [
+                self.resize_at,
+                self.refresh_at,
+                self.esc_at,
+                self.tick_at,
+                self.anim_at,
+                self.msg.as_ref().map(|m| m.1),
+            ]
+            .into_iter()
+            .flatten()
+            .min();
             let timeout = next.map(|t| t.saturating_duration_since(now));
             let mut fds = [
                 pollfd(0),
@@ -230,6 +256,10 @@ impl App {
         }
         if due(self.msg.as_ref().map(|m| m.1)) {
             self.msg = None;
+            self.draw();
+        }
+        if due(self.anim_at) {
+            self.anim_at = None;
             self.draw();
         }
     }
@@ -690,6 +720,7 @@ impl App {
         let hit = self.hit_at(m.x, m.y);
         match m.kind {
             MouseKind::Press(0) => {
+                self.marquee = None;
                 if let Hit::Chevron(wid) = &hit
                     && let Some(w) = self.snap.as_ref().and_then(|s| s.window(wid))
                 {
@@ -735,8 +766,19 @@ impl App {
             }
             MouseKind::Move => {
                 let hover = hit.node();
-                if hover != self.hover {
+                let hover_split = match hit {
+                    Hit::Split(d) => Some(d),
+                    _ => None,
+                };
+                let now = Instant::now();
+                match (&mut self.marquee, &hover) {
+                    (Some(m), Some(k)) if m.key == *k => m.last_motion = now,
+                    (_, Some(k)) => self.marquee = Some(Marquee { key: k.clone(), start: now, last_motion: now }),
+                    (_, None) => self.marquee = None,
+                }
+                if hover != self.hover || hover_split != self.hover_split {
                     self.hover = hover;
+                    self.hover_split = hover_split;
                     self.draw();
                 }
             }
@@ -763,7 +805,22 @@ impl App {
                 self.cursor = Some(NodeKey::Pane(pid.clone()));
                 self.goto_pane(&wid.clone(), &pid.clone());
             }
+            Hit::Split(dir) => self.split(*dir),
             _ => {}
+        }
+    }
+
+    /// A split button: splits the work pane with the user's own binding.
+    fn split(&mut self, dir: char) {
+        if let Err(e) = split::split(&dir.to_string(), &self.pane) {
+            let e = format!("{e:#}");
+            let text = self.strings();
+            self.say(if e.contains("no space") {
+                text.no_space()
+            } else {
+                e.rsplit(": ").next().unwrap_or(&e).to_string()
+            });
+            self.draw();
         }
     }
 
@@ -914,11 +971,19 @@ impl App {
             label_styles: snap.cfg.label_styles,
             cursor: if focused { self.cursor.as_ref() } else { None },
             hover: self.hover.as_ref(),
+            hover_split: self.hover_split,
             drag: self.drag.as_ref(),
+            marquee: self
+                .marquee
+                .as_ref()
+                .filter(|_| self.press.is_none() && self.drag.is_none())
+                .map(|m| (&m.key, m.start.elapsed())),
+            overflow: Cell::new(None),
         };
         let list = view::list(&ctx);
         let mut screen = Canvas::new(w, h, ctx.plain());
-        let header_h = if h >= 4 { view::header(&mut screen, &ctx, focused, &text) } else { 0 };
+        let toolbar = snap.cfg.buttons && h >= 10;
+        let header_h = if h >= 4 { view::header(&mut screen, &ctx, focused, toolbar, &text) } else { 0 };
         let footer = if rail { Footer::default() } else { self.footer(&ctx, &text, focused) };
         let mut footer_h = footer.height();
         if h < header_h + footer_h + 3 {
@@ -950,6 +1015,20 @@ impl App {
         let mut out = String::new();
         screen.encode(&mut out);
         let _ = term::write(&out);
+
+        // Keep a scrolling label moving; stop a cycle after the pointer last
+        // moved, and redraw once more to put the "…" back.
+        let overflow = ctx.overflow.get();
+        self.anim_at = None;
+        if let (Some(dist), Some(m)) = (overflow, &self.marquee) {
+            if m.last_motion.elapsed() < view::marquee_cycle(dist) {
+                self.anim_at = Some(Instant::now() + MARQUEE_FRAME);
+            } else {
+                self.marquee = None;
+                self.hover = None;
+                self.anim_at = Some(Instant::now());
+            }
+        }
 
         let offset = header_h as i32 - self.scroll as i32;
         let groups =

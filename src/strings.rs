@@ -77,6 +77,19 @@ impl Strings {
         if self.zh { format!("恢复默认 {n} 列") } else { format!("default {n} cols") }
     }
 
+    /// The split buttons: split-window -h and -v.
+    pub fn split_h(&self) -> String {
+        self.pick("水平分割", "hsplit")
+    }
+
+    pub fn split_v(&self) -> String {
+        self.pick("竖直分割", "vsplit")
+    }
+
+    pub fn no_space(&self) -> String {
+        self.pick("当前 pane 太小", "pane too small to split")
+    }
+
     pub fn side(&self, right: bool) -> String {
         match (self.zh, right) {
             (true, true) => "移到右侧".into(),

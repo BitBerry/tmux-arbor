@@ -4,6 +4,7 @@
 
 ```
  work  4 windows       TREE │
+  水平分割 %   竖直分割 "   │
 ────────────────────────────│
  ├─ ▾ 1:editor*             │  nvim …
  │  ├─ 1 nvim               │
@@ -60,7 +61,19 @@ run-shell ~/.tmux/plugins/tmux-arbor/arbor.tmux
 
 - `branches` 树枝：一行一个节点，`├─` 连线，最紧凑。
 - `blocks` 线框：每个 window 一个细线框，标题嵌在上边框里。
-- `map` 版图：pane 按真实分屏画成格子；侧边栏窄于 24 列时自动退化成 branches。
+- `map` 版图：pane 按真实分屏画成格子，最小的 pane 占一行、整张图最多 6 行；侧边栏窄于 24 列时自动退化成 branches。
+
+被截断的 window 名或 pane 命令，鼠标停在上面时会来回滚动露出全文，两端各停 0.7 秒。
+
+## 分割
+
+标题下方有两个按钮：`◫ 水平分割` 和 `⊟ 竖直分割`，旁边显示的是你自己绑定的键。插件加载时用 `list-keys -T prefix` 读出所有 `split-window` 绑定（包括自定义的，比如 `bind | split-window -h -c "#{pane_current_path}"`）。
+
+- 点按钮：用你的绑定分割工作区的当前 pane，焦点跟到新 pane。
+- 树有焦点时按 prefix + 分割键：同样分割工作区的当前 pane，而不是侧边栏本身。
+- 其他时候这些键完全按原样工作。
+
+侧边栏变窄时按钮会依次省掉图标、文字，只留键。不想要按钮可以 `set -g @arbor-buttons off`。
 
 ## 宽度
 
@@ -84,6 +97,7 @@ prefix 快捷键不抢焦点，随时可用；聚焦侧边栏后进入 vim 风�
 | `T` | 聚焦侧边栏 |
 | `W` | 完整 › 窄条 › 隐藏 循环 |
 | `n` `p` `l` `1`–`9` | 原生切换 window，树同步 |
+| `%` `"`（你的分割键） | 原生分割；树有焦点时分割的是工作区的 pane |
 | `(` `)` | 原生切换 session，树整棵替换 |
 
 | 聚焦时 | 作用 |
@@ -115,6 +129,8 @@ prefix 快捷键不抢焦点，随时可用；聚焦侧边栏后进入 vim 风�
 | 拖 pane 到同 window 的另一个 pane | 交换位置 | `swap-pane` |
 | 拖 pane 到「+ 拆成新 window」 | 拆出 | `break-pane` |
 | 状态栏 `≡` | 显示 / 隐藏 | `arbor toggle` |
+| 单击 `◫ 水平分割` / `⊟ 竖直分割` | 分割工作区的当前 pane | 你自己的 `split-window` 绑定 |
+| 悬停在被截断的名字上 | 来回滚动露出全文 | |
 
 ## 配置
 
@@ -136,6 +152,7 @@ set -g @arbor-theme                 'auto'      # auto | light | dark
 set -g @arbor-bg                    ''          # 侧边栏底色，如 '#e7e7ea'；留空用终端底色
 set -g @arbor-lang                  'zh'        # zh | en
 set -g @arbor-hints                 on          # 底部按键提示
+set -g @arbor-buttons               on          # 标题下方的分割按钮
 set -g @arbor-interval              '2'         # 可见时每隔几秒检查 pane 命令；0 关闭
 set -g @arbor-key-toggle            'Tab'       # 'none' 表示不绑定
 set -g @arbor-key-focus             'T'
@@ -149,6 +166,7 @@ set -g @arbor-key-cycle             'W'
 ```
 arbor toggle | focus | cycle | rail | flip
 arbor resize <+N|-N|N|reset>
+arbor split <h|v> <侧边栏 pane>   # 用你的绑定分割旁边的工作区 pane
 arbor sync | notify
 arbor uninstall      # 关掉所有侧边栏，恢复状态栏、按键和 hook
 ```
@@ -159,6 +177,8 @@ arbor uninstall      # 关掉所有侧边栏，恢复状态栏、按键和 hook
 - window 文字用 `#{E:window-status-format}` 在 tmux 里展开，和状态栏完全一致。
 - 刷新由 hook 驱动（`session-window-changed`、`window-pane-changed`、`window-layout-changed`、`window-renamed`、`pane-exited` 等），hook 用信号通知各侧边栏。tmux 没有"pane 里的命令变了"这个事件，所以侧边栏**可见时**每 `@arbor-interval` 秒查一次 pane 命令，没变化不重画。
 - 树内的点击和拖拽由 arbor 自己读鼠标事件（SGR 1006）。分隔线拖动是 tmux 原生 resize，arbor 在 SIGWINCH 时判断：window 大小和 pane 都没变才算用户拖动，再做吸附和记忆；终端缩放、分屏、`select-layout` 只会让侧边栏回到原宽度和原位置。
+- 你的 `split-window` 绑定被包了一层 `if-shell -F '#{@arbor-sidebar}'`：只有当前 pane 是侧边栏时才改由 arbor 处理，原始绑定存在 `@arbor-splits`，`arbor uninstall` 会原样恢复。
+- tmux 不会告诉 pane"鼠标移走了"，所以悬停滚动在最后一次鼠标移动后跑完一个来回就停下。
 - 焦点在树上时 window 不会被 automatic-rename 改名成 `arbor`。
 - 窗口里最后一个 shell 退出后，侧边栏也随之退出，window 正常关闭。
 

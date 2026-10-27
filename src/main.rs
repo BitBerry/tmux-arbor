@@ -8,6 +8,7 @@ mod label;
 mod model;
 mod screen;
 mod sidebar;
+mod split;
 mod status;
 mod strings;
 mod term;
