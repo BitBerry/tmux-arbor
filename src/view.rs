@@ -2,12 +2,11 @@
 //! (branches, blocks, map) or as the 7-column rail, plus the header and
 //! footer around the list.
 
-use std::cell::Cell;
-use std::time::Duration;
+use std::cell::RefCell;
 
 use crate::config::{MAP_MIN, Variant};
 use crate::model::{NodeKey, PaneInfo, Snapshot, Win, expanded};
-use crate::screen::{BOLD, Canvas, Color, DIM, OVERLINE, Style, UNDER_DASHED, UNDERLINE, skip_width, truncate, width};
+use crate::screen::{BOLD, Canvas, Color, DIM, OVERLINE, Style, UNDER_DASHED, UNDERLINE, take_width, truncate, width};
 use crate::strings::Strings;
 use crate::theme::Palette;
 
@@ -67,10 +66,18 @@ pub struct Ctx<'a> {
     /// The split button under the pointer.
     pub hover_split: Option<char>,
     pub drag: Option<&'a Drag>,
-    /// The node whose cut-off text is scrolling, and for how long.
-    pub marquee: Option<(&'a NodeKey, Duration)>,
-    /// Set while drawing: how many columns the marquee text overflows by.
-    pub overflow: Cell<Option<u16>>,
+    /// The hovered node: if its text is cut off, a tooltip shows all of it.
+    pub tip_for: Option<&'a NodeKey>,
+    /// Set while drawing: where that cut-off text sits, and all of it.
+    pub tip: RefCell<Option<Tip>>,
+}
+
+/// Cut-off text under the pointer, in list coordinates.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Tip {
+    pub x: u16,
+    pub y: u16,
+    pub text: String,
 }
 
 #[derive(Clone, Debug)]
@@ -171,16 +178,12 @@ impl Ctx<'_> {
         look
     }
 
-    /// Columns to scroll `key`'s text by, when it is the marquee and its
-    /// `total` columns do not fit in `avail`.
-    fn scroll(&self, key: &NodeKey, total: usize, avail: usize) -> Option<usize> {
-        let (k, elapsed) = self.marquee?;
-        if k != key || total <= avail {
-            return None;
+    /// Records the tooltip when `key` is hovered and its text, drawn at
+    /// (x, y), does not fit in `avail` columns.
+    fn note_cut(&self, key: &NodeKey, x: u16, y: u16, text: impl FnOnce() -> String, total: usize, avail: usize) {
+        if self.tip_for == Some(key) && total > avail {
+            *self.tip.borrow_mut() = Some(Tip { x, y, text: text() });
         }
-        let dist = total - avail;
-        self.overflow.set(Some(dist as u16));
-        Some(marquee_offset(dist, elapsed))
     }
 
     fn chevron(&self, w: &Win) -> &'static str {
@@ -194,59 +197,13 @@ impl Ctx<'_> {
     }
 }
 
-/// Hover marquee timing, after the design: hold at each end, then glide
-/// about 28ms per pixel (a column is roughly 8px), easing in and out.
-const MARQUEE_HOLD: f64 = 700.0;
-const MARQUEE_COL: f64 = 218.0;
-
-fn marquee_travel(dist: usize) -> f64 {
-    (dist as f64 * MARQUEE_COL).max(700.0)
-}
-
-/// One full cycle: out, hold, back, hold.
-pub fn marquee_cycle(dist: u16) -> Duration {
-    Duration::from_millis((2.0 * (marquee_travel(dist as usize) + 2.0 * MARQUEE_HOLD)) as u64)
-}
-
-/// Columns scrolled `elapsed` into a back-and-forth marquee over `dist`.
-pub fn marquee_offset(dist: usize, elapsed: Duration) -> usize {
-    let travel = marquee_travel(dist);
-    let pass = travel + 2.0 * MARQUEE_HOLD;
-    let t = elapsed.as_secs_f64() * 1000.0 % (2.0 * pass);
-    let t = if t > pass { 2.0 * pass - t } else { t };
-    let p = ((t - MARQUEE_HOLD) / travel).clamp(0.0, 1.0);
-    let eased = if p < 0.5 { 4.0 * p * p * p } else { 1.0 - (-2.0 * p + 2.0).powi(3) / 2.0 };
-    (eased * dist as f64).round() as usize
-}
-
-/// Writes `spans` from `x` with their first `skip` columns scrolled away,
-/// clipped at `limit`.
-fn put_scrolled(c: &mut Canvas<Hit>, x: u16, y: u16, spans: &[(String, Style)], skip: usize, limit: u16) -> u16 {
-    let mut x = x;
-    let mut skip = skip;
-    for (s, st) in spans {
-        let w = width(s);
-        if skip >= w {
-            skip -= w;
-            continue;
-        }
-        let (pad, rest) = skip_width(s, skip);
-        skip = 0;
-        x = c.put(x, y, &" ".repeat(pad), *st, limit);
-        x = c.put(x, y, rest, *st, limit);
-    }
-    x
-}
-
 /// Writes a window's label from `x`, cut with "…" so it ends before
-/// `limit`, or scrolling when it is the marquee.
+/// `limit`.
 fn put_label(c: &mut Canvas<Hit>, ctx: &Ctx, w: &Win, x: u16, y: u16, limit: u16, look: &Look) -> u16 {
     let spans = if look.plain { vec![(w.label.plain(), look.base)] } else { w.label.spans(look.base) };
     let avail = limit.saturating_sub(x) as usize;
     let total: usize = spans.iter().map(|(s, _)| width(s)).sum();
-    if let Some(skip) = ctx.scroll(&NodeKey::Window(w.id.clone()), total, avail) {
-        return put_scrolled(c, x, y, &spans, skip, limit);
-    }
+    ctx.note_cut(&NodeKey::Window(w.id.clone()), x, y, || w.label.plain(), total, avail);
     let mut x = x;
     if total <= avail {
         for (s, st) in &spans {
@@ -275,13 +232,11 @@ fn put_text(c: &mut Canvas<Hit>, x: u16, y: u16, s: &str, style: Style, limit: u
     c.put(x, y, &truncate(s, limit.saturating_sub(x) as usize), style, limit)
 }
 
-/// A pane's command: cut with "…", or scrolling when it is the marquee.
+/// A pane's command, cut with "…".
 fn put_cmd(c: &mut Canvas<Hit>, ctx: &Ctx, pane: &PaneInfo, x: u16, y: u16, style: Style, limit: u16) -> u16 {
     let key = NodeKey::Pane(pane.id.clone());
-    match ctx.scroll(&key, width(&pane.cmd), limit.saturating_sub(x) as usize) {
-        Some(skip) => put_scrolled(c, x, y, &[(pane.cmd.clone(), style)], skip, limit),
-        None => put_text(c, x, y, &pane.cmd, style, limit),
-    }
+    ctx.note_cut(&key, x, y, || pane.cmd.clone(), width(&pane.cmd), limit.saturating_sub(x) as usize);
+    put_text(c, x, y, &pane.cmd, style, limit)
 }
 
 fn win_height(ctx: &Ctx, variant: Variant, w: &Win) -> u16 {
@@ -687,12 +642,13 @@ fn draw_rail(c: &mut Canvas<Hit>, y: u16, ctx: &Ctx, w: &Win, nodes: &mut Vec<(N
     nodes.push((NodeKey::Window(w.id.clone()), y, y));
 }
 
-/// Session name, window count and the TREE badge; the split buttons when
-/// `toolbar`; then a rule. Returns the rows used.
-pub fn header(c: &mut Canvas<Hit>, ctx: &Ctx, focused: bool, toolbar: bool, text: &Strings) -> u16 {
+/// Session name and window count; on the right the TREE badge and, with
+/// `buttons`, the two split buttons; then a rule. Two rows.
+pub fn header(c: &mut Canvas<Hit>, ctx: &Ctx, focused: bool, buttons: bool, text: &Strings) -> u16 {
     let p = ctx.pal;
     let full = c.w;
     let name = &ctx.snap.session_name;
+    let mut tip = None;
     if ctx.rail {
         let initial: String = name.chars().next().map(|ch| ch.to_uppercase().collect()).unwrap_or_default();
         let st = if focused {
@@ -705,74 +661,73 @@ pub fn header(c: &mut Canvas<Hit>, ctx: &Ctx, focused: bool, toolbar: bool, text
         c.fill(x, x + bw, 0, st);
         c.put(x + 1, 0, &initial, st, x + bw);
     } else {
-        let badge = " TREE ";
-        let name_end = if focused { full.saturating_sub(width(badge) as u16 + 2) } else { full.saturating_sub(1) };
-        let x = put_text(c, 1, 0, name, ctx.plain().fg(p.accent).with(BOLD), name_end);
-        let count = text.windows(ctx.snap.windows.len());
-        if x + 2 + width(&count) as u16 <= name_end {
-            c.put(x + 2, 0, &count, ctx.plain().fg(p.muted), name_end);
+        let mut right = full.saturating_sub(1);
+        if buttons {
+            // Icon buttons, as in the design; their tooltip names the
+            // split and the user's own key for it.
+            let cfg = &ctx.snap.cfg;
+            let items = [('h', "◫", text.split_h(), &cfg.split_h_key), ('v', "⊟", text.split_v(), &cfg.split_v_key)];
+            let start = full.saturating_sub(7);
+            for (i, (dir, icon, name, key)) in items.iter().enumerate() {
+                let x0 = start + 3 * i as u16;
+                let hot = ctx.hover_split == Some(*dir);
+                let st = if hot { Style::default().bg(p.cur_win_bg).fg(p.cur_win_fg) } else { ctx.plain().fg(p.text) };
+                c.put(x0, 0, &format!(" {icon} "), st, full);
+                c.set_hit(x0, x0 + 3, 0, &Hit::Split(*dir));
+                if hot {
+                    let label = if key.is_empty() { name.clone() } else { format!("{name} · {} {key}", cfg.prefix) };
+                    tip = Some((x0 + 3, label));
+                }
+            }
+            right = start.saturating_sub(1);
         }
         if focused {
-            let bx = full.saturating_sub(width(badge) as u16 + 1);
-            c.put(bx, 0, badge, Style::default().bg(p.cursor_bg).fg(p.cursor_fg).with(BOLD), full);
+            let badge = " TREE ";
+            let bx = right.saturating_sub(width(badge) as u16);
+            c.put(bx, 0, badge, Style::default().bg(p.cursor_bg).fg(p.cursor_fg).with(BOLD), right);
+            right = bx.saturating_sub(1);
         }
-    }
-    let mut y = 1;
-    if toolbar && !ctx.rail {
-        buttons(c, y, ctx, text);
-        y += 1;
+        let x = put_text(c, 1, 0, name, ctx.plain().fg(p.accent).with(BOLD), right);
+        let count = text.windows(ctx.snap.windows.len());
+        if x + 2 + width(&count) as u16 <= right {
+            c.put(x + 2, 0, &count, ctx.plain().fg(p.muted), right);
+        }
     }
     let rule = ctx.plain().fg(p.divider);
     for x in 0..full {
-        c.put(x, y, "─", rule, full);
+        c.put(x, 1, "─", rule, full);
     }
-    y + 1
+    // A button's tooltip hangs below it, right-aligned to it.
+    if let Some((end, label)) = tip {
+        tooltip(c, ctx, end.saturating_sub(width(&label) as u16 + 2), 1, &label, c.h);
+    }
+    2
 }
 
-/// The design's split buttons: an icon, a label and the user's own key for
-/// split-window -h and -v. Narrow sidebars drop the icon, then the label.
-fn buttons(c: &mut Canvas<Hit>, y: u16, ctx: &Ctx, text: &Strings) {
-    let p = ctx.pal;
-    let cfg = &ctx.snap.cfg;
-    let items =
-        [('h', "◫", text.split_h(), cfg.split_h_key.as_str()), ('v', "⊟", text.split_v(), cfg.split_v_key.as_str())];
-    // Each chip as (text, is_key) parts, for (icon, label).
-    let parts = |(_, icon, name, key): &(char, &str, String, &str), show: (bool, bool)| {
-        let mut v: Vec<(String, bool)> = Vec::new();
-        if show.0 {
-            v.push((format!(" {icon}"), false));
+/// The design's floating label: the whole of something cut off, drawn
+/// over whatever is there from column `x`. A sidebar is too narrow to let
+/// it spill out, so it shifts left to fit, and wraps onto the rows below
+/// (before `bottom`) when even that is not enough.
+pub fn tooltip(c: &mut Canvas<Hit>, ctx: &Ctx, x: u16, y: u16, text: &str, bottom: u16) {
+    let st = Style::default().bg(ctx.pal.chip_bg).fg(ctx.pal.chip_fg);
+    let full = c.w as usize;
+    let tw = width(text);
+    if tw + 2 <= full {
+        let x = (x as usize).min(full - tw - 2) as u16;
+        c.put(x, y, &format!(" {text} "), st, c.w);
+        return;
+    }
+    let mut rest = text;
+    let mut y = y;
+    while !rest.is_empty() && y < bottom {
+        let part = take_width(rest, full.saturating_sub(2).max(2));
+        if part.is_empty() {
+            break;
         }
-        if show.1 {
-            v.push((format!(" {name}"), false));
-        }
-        if !key.is_empty() {
-            v.push((" ".into(), false));
-            v.push((key.to_string(), true));
-        }
-        v.push((" ".into(), false));
-        v
-    };
-    let room = c.w.saturating_sub(2) as usize;
-    let span =
-        |show| items.iter().map(|i| parts(i, show).iter().map(|(t, _)| width(t)).sum::<usize>()).sum::<usize>() + 1;
-    let show =
-        [(true, true), (false, true), (true, false)].into_iter().find(|&s| span(s) <= room).unwrap_or((true, false));
-    let end = c.w.saturating_sub(1);
-    let mut x = 1;
-    for item in &items {
-        let hot = ctx.hover_split == Some(item.0);
-        let st = if hot {
-            Style::default().bg(p.cur_win_bg).fg(p.cur_win_fg)
-        } else {
-            Style::default().bg(p.hover_bg).fg(p.text)
-        };
-        let x0 = x;
-        for (t, is_key) in parts(item, show) {
-            let style = if is_key { st.fg(if hot { p.cur_win_sub } else { p.muted }) } else { st };
-            x = c.put(x, y, &t, style, end);
-        }
-        c.set_hit(x0, x, y, &Hit::Split(item.0));
-        x += 1;
+        c.fill(0, c.w, y, st);
+        c.put(1, y, part, st, c.w);
+        rest = &rest[part.len()..];
+        y += 1;
     }
 }
 
@@ -852,8 +807,8 @@ mod tests {
             hover: None,
             hover_split: None,
             drag: None,
-            marquee: None,
-            overflow: Cell::new(None),
+            tip_for: None,
+            tip: RefCell::new(None),
         }
     }
 
@@ -948,54 +903,61 @@ mod tests {
     }
 
     #[test]
-    fn split_buttons_show_the_users_keys() {
+    fn split_buttons_sit_right_of_the_title() {
         let mut snap = sample();
-        snap.cfg.split_h_key = "%".into();
-        snap.cfg.split_v_key = "\"".into();
+        snap.cfg.prefix = "C-x".into();
+        snap.cfg.split_h_key = "\\".into();
         let pal = theme::light();
         let text = Strings::new(crate::config::Lang::Zh);
         let mut c = Canvas::new(28, 4, Style::default());
-        let rows = header(&mut c, &ctx(&snap, &pal, Variant::Branches, 28), false, true, &text);
-        assert_eq!(rows, 3);
-        assert_eq!(c.row_text(1).trim_end(), "  水平分割 %   竖直分割 \"");
-        assert_eq!(c.hit(3, 1), Some(&Hit::Split('h')));
-        assert_eq!(c.hit(18, 1), Some(&Hit::Split('v')));
-        // Wide enough for the icons too.
-        let mut c = Canvas::new(34, 4, Style::default());
-        header(&mut c, &ctx(&snap, &pal, Variant::Branches, 34), false, true, &text);
-        assert_eq!(c.row_text(1).trim_end(), "  ◫ 水平分割 %   ⊟ 竖直分割 \"");
+        let mut cx = ctx(&snap, &pal, Variant::Branches, 28);
+        assert_eq!(header(&mut c, &cx, true, true, &text), 2);
+        assert_eq!(c.row_text(0).trim_end(), " work          TREE   ◫  ⊟");
+        assert_eq!(c.hit(22, 0), Some(&Hit::Split('h')));
+        assert_eq!(c.hit(25, 0), Some(&Hit::Split('v')));
+        // Hovering one shows what it does and the user's key.
+        cx.hover_split = Some('h');
+        let mut c = Canvas::new(28, 4, Style::default());
+        header(&mut c, &cx, false, true, &text);
+        assert_eq!(c.row_text(0).trim_end(), " work  4 windows      ◫  ⊟");
+        assert_eq!(c.row_text(1), "────── 水平分割 · C-x \\ ────");
+        // No key bound: the name alone.
+        cx.hover_split = Some('v');
+        let mut c = Canvas::new(28, 4, Style::default());
+        header(&mut c, &cx, false, true, &text);
+        assert_eq!(c.row_text(1), "───────────────── 竖直分割 ─");
     }
 
     #[test]
-    fn marquee_scrolls_a_cut_label() {
+    fn hovered_cut_text_gets_a_tooltip() {
         let mut snap = sample();
         snap.windows[2].label = Label::parse("3:staging-db-migrations");
         let pal = theme::light();
         let key = NodeKey::Window("@3".into());
         let mut c = ctx(&snap, &pal, Variant::Branches, 20);
-        // Start: held at the beginning, no ellipsis.
-        c.marquee = Some((&key, Duration::ZERO));
-        assert_eq!(list(&c).canvas.row_text(5).trim_end(), " ├─   3:staging-db");
-        assert_eq!(c.overflow.get(), Some(11));
-        // Fully scrolled: the tail shows.
-        c.marquee = Some((&key, Duration::from_millis(700 + 11 * 218 + 10)));
-        assert_eq!(list(&c).canvas.row_text(5).trim_end(), " ├─   b-migrations");
-        // Another node's label is cut as usual.
-        let other = NodeKey::Window("@4".into());
-        c.marquee = Some((&other, Duration::ZERO));
-        c.overflow.set(None);
-        assert_eq!(list(&c).canvas.row_text(5).trim_end(), " ├─   3:staging-d…");
-        assert_eq!(c.overflow.get(), None);
+        c.tip_for = Some(&key);
+        list(&c);
+        assert_eq!(c.tip.borrow().clone(), Some(Tip { x: 6, y: 5, text: "3:staging-db-migrations".into() }));
+        // Text that fits needs none.
+        let fits = NodeKey::Window("@4".into());
+        c.tip_for = Some(&fits);
+        *c.tip.borrow_mut() = None;
+        list(&c);
+        assert_eq!(*c.tip.borrow(), None);
     }
 
     #[test]
-    fn marquee_goes_out_and_back() {
-        assert_eq!(marquee_offset(10, Duration::ZERO), 0);
-        assert_eq!(marquee_offset(10, Duration::from_millis(600)), 0);
-        let pass = 700 + 2180 + 700;
-        assert_eq!(marquee_offset(10, Duration::from_millis(pass - 100)), 10);
-        assert_eq!(marquee_offset(10, Duration::from_millis(2 * pass - 100)), 0);
-        assert_eq!(marquee_cycle(10), Duration::from_millis(2 * pass));
+    fn tooltips_shift_then_wrap() {
+        let snap = sample();
+        let pal = theme::light();
+        let c = ctx(&snap, &pal, Variant::Branches, 20);
+        let mut canvas = Canvas::new(20, 3, Style::default());
+        tooltip(&mut canvas, &c, 5, 0, "staging-db-mig", 3);
+        assert_eq!(canvas.row_text(0), "     staging-db-mig ");
+        let mut canvas = Canvas::new(20, 3, Style::default());
+        tooltip(&mut canvas, &c, 5, 1, "3:staging-db-migrations", 3);
+        assert_eq!(canvas.row_text(1), " 3:staging-db-migra ");
+        assert_eq!(canvas.row_text(2), " tions              ");
     }
 
     #[test]

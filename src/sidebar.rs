@@ -3,7 +3,7 @@
 //! it (SIGUSR1), re-detects the theme on SIGUSR2, and handles its own
 //! resizes on SIGWINCH.
 
-use std::cell::Cell;
+use std::cell::RefCell;
 use std::io::{self, Read};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 
 use crate::cli;
-use crate::config::{Config, HIDE_BELOW, MAX_W, MIN_FULL, Mode, Theme};
+use crate::config::{Config, HIDE_BELOW, MAX_W, MIN_FULL, Mode, Side, Theme};
 use crate::input::{Event, Key, Mouse, MouseKind, Parser};
 use crate::label::parse_color;
 use crate::model::{NodeKey, Snapshot, expanded, pane_number};
@@ -30,8 +30,11 @@ const RESIZE_SETTLE: Duration = Duration::from_millis(150);
 const REFRESH_COALESCE: Duration = Duration::from_millis(15);
 const ESC_WAIT: Duration = Duration::from_millis(25);
 const MESSAGE_TIME: Duration = Duration::from_millis(1600);
-/// Frame interval while a marquee scrolls.
-const MARQUEE_FRAME: Duration = Duration::from_millis(80);
+/// tmux never says the pointer left the pane, so hover (and its tooltip)
+/// ends this long after the last motion; sooner when that motion was on
+/// the edge facing the work area.
+const HOVER_IDLE: Duration = Duration::from_secs(3);
+const HOVER_EDGE: Duration = Duration::from_millis(300);
 
 struct Signals {
     winch: UnixStream,
@@ -74,15 +77,6 @@ fn drain(mut s: &UnixStream) -> bool {
     any
 }
 
-/// A hovered node whose text is cut off, scrolling to show the rest.
-struct Marquee {
-    key: NodeKey,
-    start: Instant,
-    /// tmux reports no pointer leaving the pane, so a marquee runs one full
-    /// cycle past the last motion and then stops.
-    last_motion: Instant,
-}
-
 struct Press {
     x: u16,
     y: u16,
@@ -110,8 +104,7 @@ struct App {
     cursor: Option<NodeKey>,
     hover: Option<NodeKey>,
     hover_split: Option<char>,
-    marquee: Option<Marquee>,
-    anim_at: Option<Instant>,
+    hover_until: Option<Instant>,
     /// A node to scroll into view on the next frame.
     reveal: Option<NodeKey>,
     scroll: u16,
@@ -166,8 +159,7 @@ impl App {
             cursor: None,
             hover: None,
             hover_split: None,
-            marquee: None,
-            anim_at: None,
+            hover_until: None,
             reveal: None,
             scroll: 0,
             press: None,
@@ -195,7 +187,7 @@ impl App {
                 self.refresh_at,
                 self.esc_at,
                 self.tick_at,
-                self.anim_at,
+                self.hover_until,
                 self.msg.as_ref().map(|m| m.1),
             ]
             .into_iter()
@@ -258,8 +250,10 @@ impl App {
             self.msg = None;
             self.draw();
         }
-        if due(self.anim_at) {
-            self.anim_at = None;
+        if due(self.hover_until) {
+            self.hover_until = None;
+            self.hover = None;
+            self.hover_split = None;
             self.draw();
         }
     }
@@ -590,7 +584,7 @@ impl App {
             }
             Key::Char('p') => {
                 cfg.position = cfg.position.other();
-                self.say(text.side(cfg.position == crate::config::Side::Right));
+                self.say(text.side(cfg.position == Side::Right));
                 let _ = cli::flip(&cfg);
                 if let Some(s) = &mut self.snap {
                     s.cfg = cfg;
@@ -720,7 +714,6 @@ impl App {
         let hit = self.hit_at(m.x, m.y);
         match m.kind {
             MouseKind::Press(0) => {
-                self.marquee = None;
                 if let Hit::Chevron(wid) = &hit
                     && let Some(w) = self.snap.as_ref().and_then(|s| s.window(wid))
                 {
@@ -770,12 +763,13 @@ impl App {
                     Hit::Split(d) => Some(d),
                     _ => None,
                 };
-                let now = Instant::now();
-                match (&mut self.marquee, &hover) {
-                    (Some(m), Some(k)) if m.key == *k => m.last_motion = now,
-                    (_, Some(k)) => self.marquee = Some(Marquee { key: k.clone(), start: now, last_motion: now }),
-                    (_, None) => self.marquee = None,
-                }
+                // The sidebar is full height: the pointer leaves it towards
+                // the work area.
+                let edge = match self.cfg().position {
+                    Side::Left => m.x + 1 >= self.size.0,
+                    Side::Right => m.x == 0,
+                };
+                self.hover_until = Some(Instant::now() + if edge { HOVER_EDGE } else { HOVER_IDLE });
                 if hover != self.hover || hover_split != self.hover_split {
                     self.hover = hover;
                     self.hover_split = hover_split;
@@ -789,6 +783,10 @@ impl App {
                 } else {
                     (self.scroll + 3).min(max)
                 };
+                // Scrolling moves the rows from under the pointer; the
+                // design drops tooltips on the wheel too.
+                self.hover = None;
+                self.hover_split = None;
                 self.draw();
             }
             _ => {}
@@ -973,17 +971,12 @@ impl App {
             hover: self.hover.as_ref(),
             hover_split: self.hover_split,
             drag: self.drag.as_ref(),
-            marquee: self
-                .marquee
-                .as_ref()
-                .filter(|_| self.press.is_none() && self.drag.is_none())
-                .map(|m| (&m.key, m.start.elapsed())),
-            overflow: Cell::new(None),
+            tip_for: self.hover.as_ref().filter(|_| self.press.is_none() && self.drag.is_none()),
+            tip: RefCell::new(None),
         };
         let list = view::list(&ctx);
         let mut screen = Canvas::new(w, h, ctx.plain());
-        let toolbar = snap.cfg.buttons && h >= 10;
-        let header_h = if h >= 4 { view::header(&mut screen, &ctx, focused, toolbar, &text) } else { 0 };
+        let header_h = if h >= 4 { view::header(&mut screen, &ctx, focused, snap.cfg.buttons, &text) } else { 0 };
         let footer = if rail { Footer::default() } else { self.footer(&ctx, &text, focused) };
         let mut footer_h = footer.height();
         if h < header_h + footer_h + 3 {
@@ -1012,23 +1005,16 @@ impl App {
         if footer_h > 0 {
             view::footer(&mut screen, h - footer_h, &ctx, &footer);
         }
+        // The hovered node's cut-off text, whole, floating over the list.
+        if let Some(tip) = ctx.tip.borrow().as_ref() {
+            let y = (header_h + tip.y).checked_sub(self.scroll).filter(|y| (header_h..header_h + list_h).contains(y));
+            if let Some(y) = y {
+                view::tooltip(&mut screen, &ctx, tip.x.saturating_sub(1), y, &tip.text, header_h + list_h);
+            }
+        }
         let mut out = String::new();
         screen.encode(&mut out);
         let _ = term::write(&out);
-
-        // Keep a scrolling label moving; stop a cycle after the pointer last
-        // moved, and redraw once more to put the "…" back.
-        let overflow = ctx.overflow.get();
-        self.anim_at = None;
-        if let (Some(dist), Some(m)) = (overflow, &self.marquee) {
-            if m.last_motion.elapsed() < view::marquee_cycle(dist) {
-                self.anim_at = Some(Instant::now() + MARQUEE_FRAME);
-            } else {
-                self.marquee = None;
-                self.hover = None;
-                self.anim_at = Some(Instant::now());
-            }
-        }
 
         let offset = header_h as i32 - self.scroll as i32;
         let groups =
