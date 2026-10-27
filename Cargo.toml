@@ -1,0 +1,22 @@
+[package]
+name = "tmux-arbor"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "A tree sidebar for tmux: the current session's windows and panes, drawn in a pane at the edge."
+repository = "https://github.com/BitBerry/tmux-arbor"
+
+[[bin]]
+name = "arbor"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+libc = "0.2"
+signal-hook = "0.3"
+unicode-width = "0.2"
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+strip = true
