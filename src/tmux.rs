@@ -5,8 +5,10 @@ use std::sync::OnceLock;
 
 use anyhow::{Context, Result, bail};
 
-/// Field separator for format queries; tmux passes it through verbatim.
-pub const SEP: char = '\x1f';
+/// Field separator for format queries. It must be printable: tmux 3.4
+/// escapes control characters in command output (\x1f comes back as
+/// "\037"), while a printable character passes through as it is.
+pub const SEP: char = '␟';
 
 fn program() -> String {
     std::env::var("ARBOR_TMUX").unwrap_or_else(|_| "tmux".to_string())
@@ -57,7 +59,10 @@ where
             if a == ";" { a.to_string() } else { escape(a) }
         })
         .collect();
-    let out = cmd.args(&args).stdin(Stdio::null()).stderr(Stdio::piped()).output().context("cannot run tmux")?;
+    // -u: a client that is not UTF-8 gets non-ASCII text (window names,
+    // labels) replaced with "_", whatever the locale of whoever started us.
+    let out =
+        cmd.arg("-u").args(&args).stdin(Stdio::null()).stderr(Stdio::piped()).output().context("cannot run tmux")?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
         bail!("tmux {}: {}", args.first().map(String::as_str).unwrap_or(""), err.trim());

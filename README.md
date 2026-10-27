@@ -21,7 +21,7 @@
 
 ## 安装
 
-需要 tmux ≥ 3.2（状态栏 ≡ 按钮需要 ≥ 3.4）和 Rust 工具链（`cargo`）。
+需要 tmux ≥ 3.2（状态栏 ≡ 按钮需要 ≥ 3.4；实测过 3.4 和 3.8）和 Rust 工具链（`cargo`）。
 
 用 [TPM](https://github.com/tmux-plugins/tpm)：
 

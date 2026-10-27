@@ -8,9 +8,14 @@ use anyhow::{Context, Result, bail};
 use crate::cli;
 use crate::tmux::{self, Batch, shell_quote};
 
-/// Separators inside @arbor-splits; neither appears in key bindings.
-const RECORD: char = '\x1e';
-const FIELD: char = '\x1d';
+/// Separators inside @arbor-splits; neither appears in key bindings. They
+/// are printable, since tmux 3.4 escapes control characters when it prints
+/// an option back.
+const RECORD: char = '␞';
+const FIELD: char = '␝';
+/// What earlier versions used, still read so their saved bindings survive.
+const OLD_RECORD: char = '\x1e';
+const OLD_FIELD: char = '\x1d';
 
 /// One prefix-table binding that runs split-window.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -159,9 +164,9 @@ fn encode(list: &[Binding]) -> String {
 }
 
 fn decode(s: &str) -> Vec<Binding> {
-    s.split(RECORD)
+    s.split([RECORD, OLD_RECORD])
         .filter_map(|r| {
-            let f: Vec<&str> = r.splitn(4, FIELD).collect();
+            let f: Vec<&str> = r.splitn(4, [FIELD, OLD_FIELD]).collect();
             let [dir, repeat, key, cmd] = f[..] else { return None };
             Some(Binding { dir: dir.chars().next()?, repeat: repeat == "1", key: key.into(), cmd: cmd.into() })
         })
@@ -334,5 +339,15 @@ bind-key    -T root   C-s     split-window -h
         let list = collect(LISTING, &[]);
         assert_eq!(decode(&encode(&list)), list);
         assert_eq!(decode(""), vec![]);
+        assert!(encode(&list).chars().all(|c| !c.is_control()));
+    }
+
+    #[test]
+    fn reads_what_earlier_versions_saved() {
+        let old = "h\x1d0\x1d\\%\x1dsplit-window -h\x1ev\x1d1\x1dM-v\x1dsplit-window -v";
+        let list = decode(old);
+        assert_eq!(list.len(), 2);
+        assert_eq!((list[0].dir, list[0].label(), list[0].cmd.as_str()), ('h', "%".into(), "split-window -h"));
+        assert!(list[1].repeat);
     }
 }
