@@ -176,7 +176,7 @@ arbor uninstall      # 关掉所有侧边栏，恢复状态栏、按键和 hook
 - 每个 window 各开一个侧边栏 pane（`split-window -hbf`，右侧不加 `-b`），里面跑 `arbor sidebar`。切 window、切 session、新建 window 时由 hook 补开，宽度和位置全局一致。
 - window 文字用 `#{E:window-status-format}` 在 tmux 里展开，和状态栏完全一致。
 - 刷新由 hook 驱动（`session-window-changed`、`window-pane-changed`、`window-layout-changed`、`window-renamed`、`pane-exited` 等），hook 用信号通知各侧边栏。tmux 没有"pane 里的命令变了"这个事件，所以侧边栏**可见时**每 `@arbor-interval` 秒查一次 pane 命令，没变化不重画。
-- 树内的点击和拖拽由 arbor 自己读鼠标事件（SGR 1006）。分隔线拖动是 tmux 原生 resize，arbor 在 SIGWINCH 时判断：window 大小和 pane 都没变才算用户拖动，再做吸附和记忆；终端缩放、分屏、`select-layout` 只会让侧边栏回到原宽度和原位置。
+- 树内的点击和拖拽由 arbor 自己读鼠标事件（SGR 1006）。分隔线拖动是 tmux 原生 resize：插件包了 `MouseDrag1Border` 给 window 打上 `@arbor-drag` 标记，拖动中侧边栏只跟随鼠标、实时显示会落到的宽度，松手（`MouseDragEnd1Border` / `MouseDragEnd1Pane`，后者在没有标记时照常把事件交给 pane）时再吸附成窄条或隐藏并记住宽度。没有这个标记的宽度变化——`prefix 空格` 换布局、`rotate-window`、`swap-pane`、分屏、终端缩放——都会让侧边栏回到原宽度、贴回原侧。
 - 你的 `split-window` 绑定被包了一层 `if-shell -F '#{@arbor-sidebar}'`：只有当前 pane 是侧边栏时才改由 arbor 处理，原始绑定存在 `@arbor-splits`，`arbor uninstall` 会原样恢复。
 - tmux 不会告诉 pane"鼠标移走了"，所以悬停高亮和提示在最后一次鼠标移动后 3 秒消失；如果最后一次移动是在朝工作区的那一列，0.3 秒就消失。滚轮也会把它们收起。
 - 焦点在树上时 window 不会被 automatic-rename 改名成 `arbor`。

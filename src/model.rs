@@ -67,6 +67,8 @@ pub struct Snapshot {
     pub at_top: bool,
     pub at_bottom: bool,
     pub zoomed: bool,
+    /// A divider in this window is being dragged with the mouse.
+    pub dragging: bool,
     pub windows: Vec<Win>,
     pub cfg: Config,
 }
@@ -96,6 +98,7 @@ impl Snapshot {
             "#{pane_at_top}",
             "#{pane_at_bottom}",
             "#{window_zoomed_flag}",
+            "#{@arbor-drag}",
         ]);
         let o = format!("O{SEP}{}", Config::query_format());
         let w = join(&[
@@ -158,6 +161,7 @@ impl Snapshot {
                         at_top: on(f[10]),
                         at_bottom: on(f[11]),
                         zoomed: on(f[12]),
+                        dragging: f.get(13).is_some_and(|d| on(d)),
                         windows: Vec::new(),
                         cfg: Config::default(),
                     });
@@ -249,14 +253,6 @@ impl Snapshot {
     /// The window holding a pane, and the pane's position among its work panes.
     pub fn find_pane(&self, id: &str) -> Option<(&Win, usize)> {
         self.windows.iter().find_map(|w| w.panes.iter().position(|p| p.id == id).map(|i| (w, i)))
-    }
-
-    /// Every pane in this sidebar's window, to tell a user's drag from a
-    /// layout change.
-    pub fn my_pane_ids(&self) -> Vec<String> {
-        self.my_window()
-            .map(|w| w.panes.iter().map(|p| p.id.clone()).chain(w.sidebars.iter().cloned()).collect())
-            .unwrap_or_default()
     }
 
     /// Navigable rows in order, honouring collapsed windows.

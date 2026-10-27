@@ -35,6 +35,9 @@ const MESSAGE_TIME: Duration = Duration::from_millis(1600);
 /// the edge facing the work area.
 const HOVER_IDLE: Duration = Duration::from_secs(3);
 const HOVER_EDGE: Duration = Duration::from_millis(300);
+/// A drag whose end tmux never reported (released off any border or pane)
+/// is finished after this long without movement.
+const DRAG_STALE: Duration = Duration::from_secs(2);
 
 struct Signals {
     winch: UnixStream,
@@ -113,18 +116,17 @@ struct App {
     frame: Option<Frame>,
     msg: Option<(String, Instant)>,
     was_focused: bool,
+    was_dragging: bool,
     /// Keys only reach the active pane, so a key means we have focus even
     /// before the snapshot says so.
     key_focus: bool,
     last_current: Option<String>,
-    /// Window width and pane set when the width was last right; a resize
-    /// with both unchanged was the user dragging the divider.
-    baseline: Option<(u16, Vec<String>)>,
     last_fix: Option<(Instant, (u16, u16))>,
     resize_at: Option<Instant>,
     refresh_at: Option<Instant>,
     esc_at: Option<Instant>,
     tick_at: Option<Instant>,
+    drag_check_at: Option<Instant>,
     quit: bool,
 }
 
@@ -167,14 +169,15 @@ impl App {
             frame: None,
             msg: None,
             was_focused: false,
+            was_dragging: false,
             key_focus: false,
             last_current: None,
-            baseline: None,
             last_fix: None,
             resize_at: None,
             refresh_at: None,
             esc_at: None,
             tick_at: None,
+            drag_check_at: None,
             quit: false,
         }
     }
@@ -214,6 +217,10 @@ impl App {
             if drain(&sig.winch) {
                 self.size = term::size();
                 self.resize_at = Some(Instant::now() + RESIZE_SETTLE);
+                // Still moving: not a drag tmux forgot to end.
+                if self.drag_check_at.is_some() {
+                    self.drag_check_at = Some(Instant::now() + DRAG_STALE);
+                }
                 self.draw();
             }
             if drain(&sig.usr1) {
@@ -242,6 +249,13 @@ impl App {
         }
         if due(self.refresh_at) {
             self.refresh();
+        }
+        if due(self.drag_check_at) {
+            self.drag_check_at = None;
+            if self.snap.as_ref().is_some_and(|s| s.dragging) {
+                let window = self.snap.as_ref().map(|s| s.window_id.clone()).unwrap_or_default();
+                let _ = cli::drag_end(Some(&window));
+            }
         }
         if due(self.tick_at) {
             self.tick();
@@ -363,6 +377,18 @@ impl App {
             self.reveal = self.cursor.clone();
         }
         self.was_focused = focused;
+        // A drag just ended and settled the width: say what it became.
+        if self.was_dragging && !snap.dragging {
+            let before = self.snap.as_ref().map(|s| (s.cfg.mode, s.cfg.width));
+            if before != Some((snap.cfg.mode, snap.cfg.width)) {
+                let text = Strings::new(snap.cfg.lang);
+                self.say(if snap.cfg.mode == Mode::Rail { text.rail() } else { text.cols_saved(snap.cfg.width) });
+            }
+        }
+        self.was_dragging = snap.dragging;
+        if !snap.dragging {
+            self.drag_check_at = None;
+        }
         self.key_focus = false;
         let current = snap.current().map(|w| w.id.clone());
         if current != self.last_current {
@@ -413,12 +439,11 @@ impl App {
     /// separately, since it may be a drag.
     fn fix_geometry(&mut self) {
         let Some(snap) = &self.snap else { return };
-        if snap.zoomed || self.resize_at.is_some() {
+        if snap.zoomed || snap.dragging || self.resize_at.is_some() {
             return;
         }
         let cfg = &snap.cfg;
         if snap.docked(cfg.position) && snap.pane_width == cfg.cols() {
-            self.baseline = Some((snap.window_width, snap.my_pane_ids()));
             return;
         }
         // A window too narrow for the width would otherwise be retried on
@@ -433,7 +458,6 @@ impl App {
 
     fn settle_resize(&mut self) {
         self.resize_at = None;
-        let before = self.baseline.clone();
         let Some(snap) = self.query() else { return };
         self.apply(snap);
         if self.quit {
@@ -445,42 +469,29 @@ impl App {
             return;
         }
         let cfg = snap.cfg.clone();
-        let now = (snap.window_width, snap.my_pane_ids());
         let docked = snap.docked(cfg.position);
         let w = snap.pane_width;
         if w == cfg.cols() && docked {
-            self.baseline = Some(now);
             self.draw();
             return;
         }
-        // Same window size, same panes: the divider was dragged.
-        if docked && before.as_ref() == Some(&now) {
-            self.adopt_width(w, cfg);
+        // Only dragging the divider changes the width on purpose. Layout
+        // commands, splits and terminal resizes are put back.
+        if docked && snap.dragging {
+            // tmux moves the divider with the pointer, and resizing under it
+            // would lose the drag: show where it would land, and settle on
+            // release (arbor drag-end).
+            let text = self.strings();
+            self.say(match w {
+                w if w < HIDE_BELOW => text.release_hides(),
+                w if w < MIN_FULL => text.rail(),
+                w => text.cols(w.min(MAX_W)),
+            });
+            self.drag_check_at = Some(Instant::now() + DRAG_STALE);
         } else {
             let _ = cli::fix_sidebar(&self.pane, &cfg);
         }
-        self.baseline = Some(now);
         self.draw();
-    }
-
-    /// The user dragged the divider to `w` columns: snap and remember.
-    fn adopt_width(&mut self, w: u16, mut cfg: Config) {
-        let text = self.strings();
-        if w < HIDE_BELOW {
-            cfg.mode = Mode::Full;
-            let _ = cli::hide(&cfg);
-            self.quit = true;
-            return;
-        }
-        if w < MIN_FULL {
-            cfg.mode = Mode::Rail;
-            self.say(text.rail());
-        } else {
-            cfg.mode = Mode::Full;
-            cfg.width = w.min(MAX_W);
-            self.say(text.cols_saved(cfg.width));
-        }
-        self.commit(cfg);
     }
 
     fn commit(&mut self, cfg: Config) {

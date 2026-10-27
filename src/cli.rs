@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 
-use crate::config::{Config, MAX_W, MIN_FULL, Mode, Side};
+use crate::config::{Config, HIDE_BELOW, MAX_W, MIN_FULL, Mode, Side};
 use crate::split;
 use crate::status;
 use crate::tmux::{self, Batch, SEP, shell_quote};
@@ -27,9 +27,10 @@ const SYNC_HOOKS: &[&str] = &[
     "after-new-session",
     "window-unzoomed",
 ];
-/// Layout commands that can pull the sidebar off its edge.
-const RELAYOUT_HOOKS: &[&str] =
-    &["after-select-layout", "after-next-layout", "after-previous-layout", "after-rotate-window", "after-swap-pane"];
+/// Layout commands that can pull the sidebar off its edge. tmux has no
+/// after-hook for next-layout, rotate-window or swap-pane; a sidebar puts
+/// itself back when those resize it, since no divider drag is marked.
+const RELAYOUT_HOOKS: &[&str] = &["after-select-layout"];
 /// Anything else the tree shows.
 const NOTIFY_HOOKS: &[&str] = &[
     "window-pane-changed",
@@ -85,6 +86,7 @@ pub fn run(args: &[String]) -> Result<()> {
         Some("hook") => hook(arg(1).unwrap_or(""), arg(2)),
         Some("border-dblclick") => border_dblclick(arg(1)),
         Some("split") => split::run(arg(1), arg(2)),
+        Some("drag-end") => drag_end(arg(1)),
         Some("uninstall") => uninstall(),
         Some("version" | "--version" | "-V") => {
             println!("arbor {}", env!("CARGO_PKG_VERSION"));
@@ -451,6 +453,43 @@ pub fn focus_work(sidebar: &str) -> Result<()> {
     Ok(())
 }
 
+/// The width a divider was dragged to, snapped: below 4 columns hides
+/// (returns true), below 14 is the rail, otherwise remembered up to 64.
+pub fn snap_width(cfg: &mut Config, w: u16) -> bool {
+    if w < HIDE_BELOW {
+        // Showing it again starts full.
+        cfg.mode = Mode::Full;
+        return true;
+    }
+    if w < MIN_FULL {
+        cfg.mode = Mode::Rail;
+    } else {
+        cfg.mode = Mode::Full;
+        cfg.width = w.min(MAX_W);
+    }
+    false
+}
+
+/// The mouse let go of a divider: snap the sidebar's width as dragged and
+/// remember it. The mark goes first, so the resize that snapping does is
+/// not taken for more dragging.
+pub fn drag_end(window: Option<&str>) -> Result<()> {
+    let Some(window) = window else { return Ok(()) };
+    let _ = tmux::run(["set-option", "-wu", "-t", window, "@arbor-drag"]);
+    let mut cfg = Config::load()?;
+    let rows = window_rows(window)?;
+    match sidebars(&rows).next() {
+        Some(sb) if cfg.mode != Mode::Hidden && !sb.zoomed && sb.docked(cfg.position) && sb.width != cfg.cols() => {
+            if snap_width(&mut cfg, sb.width) {
+                hide(&cfg)
+            } else {
+                commit(&cfg)
+            }
+        }
+        _ => Ok(()),
+    }
+}
+
 /// One step of < or >: ±2 columns, snapping to the rail below the minimum.
 pub fn step_width(cfg: &mut Config, delta: i32) -> bool {
     match cfg.mode {
@@ -529,6 +568,55 @@ fn hook(name: &str, window: Option<&str>) -> Result<()> {
 
 fn run_shell(bin: &str, args: &str) -> String {
     format!("run-shell -b \"{} {args}\"", shell_quote(bin))
+}
+
+/// Sources tmux config text, for bindings that are easiest to write in
+/// config syntax.
+fn source_conf(text: &str) -> Result<()> {
+    let path = std::env::temp_dir().join(format!("arbor-{}.conf", std::process::id()));
+    std::fs::write(&path, text)?;
+    let r = tmux::run(["source-file", &path.to_string_lossy()]);
+    let _ = std::fs::remove_file(&path);
+    r.map(|_| ())
+}
+
+/// Mouse keys wrapped to mark a divider drag, with tmux's default for each.
+const DRAG_KEYS: [(&str, &str); 3] =
+    [("MouseDrag1Border", "resize-pane -M"), ("MouseDragEnd1Border", ""), ("MouseDragEnd1Pane", "")];
+
+/// Rebinds a root-table mouse key around the user's own binding, which is
+/// saved for uninstall. `body` gets that command ("" when unbound) and
+/// returns the new binding in config syntax.
+fn wrap_mouse_key(key: &str, default: &str, body: impl Fn(&str) -> String) -> Result<()> {
+    let opt = format!("@arbor-orig-{key}");
+    let listing = tmux::run(["list-keys", "-T", "root", key]).unwrap_or_default();
+    let orig = match binding_command(&listing, key) {
+        Some(cmd) if cmd.contains("arbor") => tmux::show_global(&opt).unwrap_or_default(),
+        Some(cmd) => cmd,
+        None if listing.trim().is_empty() => String::new(),
+        None => default.to_string(),
+    };
+    tmux::set_global(&opt, &orig)?;
+    source_conf(&format!("bind-key -T root {key} {}\n", body(&orig)))
+}
+
+/// Marks divider drags so a sidebar knows a width change was the user's:
+/// tmux tells a pane nothing about why it was resized.
+fn wrap_drag_keys(bin: &str) -> Result<()> {
+    let end = format!("run-shell -b \"{} drag-end '#{{window_id}}'\"", shell_quote(bin));
+    wrap_mouse_key("MouseDrag1Border", "resize-pane -M", |orig| {
+        format!("{{\n  {orig}\n  set-option -w @arbor-drag 1\n}}")
+    })?;
+    // The drag ends over the border, or over a pane when the border snapped
+    // away from the pointer.
+    wrap_mouse_key("MouseDragEnd1Border", "", |orig| {
+        format!("{{\n  if-shell -F \"#{{@arbor-drag}}\" {{ {end} }}\n  {orig}\n}}")
+    })?;
+    wrap_mouse_key("MouseDragEnd1Pane", "", |orig| {
+        // Unbound, tmux passes the event to the pane; keep doing that.
+        let other = if orig.is_empty() { "send-keys -M" } else { orig };
+        format!("{{\n  if-shell -F \"#{{@arbor-drag}}\" {{ {end} }} {{ {other} }}\n}}")
+    })
 }
 
 /// The command half of a `list-keys` line for `key`.
@@ -640,6 +728,7 @@ fn init() -> Result<()> {
             ])
             .run()?;
     }
+    wrap_drag_keys(&bin)?;
     let listing = tmux::run(["list-keys", "-T", "root", "DoubleClick1Border"]).unwrap_or_default();
     if listing.trim().is_empty() || listing.contains("arbor") {
         tmux::run([
@@ -724,6 +813,16 @@ fn uninstall() -> Result<()> {
         let _ = std::fs::remove_file(&path);
         r?;
     }
+    for (key, _) in DRAG_KEYS {
+        let opt = format!("@arbor-orig-{key}");
+        let orig = get(&opt);
+        let _ = if orig.is_empty() {
+            tmux::run(["unbind-key", "-T", "root", key]).map(|_| ())
+        } else {
+            source_conf(&format!("bind-key -T root {key} {orig}\n"))
+        };
+        let _ = tmux::run(["set-option", "-gu", &opt]);
+    }
     if tmux::run(["list-keys", "-T", "root", "DoubleClick1Border"]).unwrap_or_default().contains("arbor") {
         let _ = tmux::run(["unbind-key", "-T", "root", "DoubleClick1Border"]);
     }
@@ -765,6 +864,19 @@ mod tests {
         assert_eq!((c.mode, c.width), (Mode::Full, 14));
         c.width = MAX_W;
         assert!(!step_width(&mut c, 2));
+    }
+
+    #[test]
+    fn dragged_widths_snap() {
+        let mut c = Config::default();
+        assert!(!snap_width(&mut c, 40));
+        assert_eq!((c.mode, c.width), (Mode::Full, 40));
+        assert!(!snap_width(&mut c, 90));
+        assert_eq!(c.width, MAX_W);
+        assert!(!snap_width(&mut c, 10));
+        assert_eq!((c.mode, c.width), (Mode::Rail, MAX_W));
+        assert!(snap_width(&mut c, 3));
+        assert_eq!(c.mode, Mode::Full);
     }
 
     #[test]

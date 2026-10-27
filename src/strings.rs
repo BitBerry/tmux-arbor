@@ -69,6 +69,14 @@ impl Strings {
         if self.zh { format!("{n} 列 · 已记住") } else { format!("{n} cols · saved") }
     }
 
+    pub fn cols(&self, n: u16) -> String {
+        if self.zh { format!("{n} 列") } else { format!("{n} cols") }
+    }
+
+    pub fn release_hides(&self) -> String {
+        self.pick("松开即隐藏", "release to hide")
+    }
+
     pub fn rail(&self) -> String {
         if self.zh { format!("窄条 · {RAIL} 列") } else { format!("rail · {RAIL} cols") }
     }
