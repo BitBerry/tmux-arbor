@@ -186,8 +186,10 @@ impl Ctx<'_> {
         }
     }
 
+    /// Small triangles: unlike ▶ ▼ (and the box-drawing guides) they are
+    /// not East Asian ambiguous width, so they take one column everywhere.
     fn chevron(&self, w: &Win) -> &'static str {
-        if self.rail || w.panes.len() < 2 {
+        if self.rail || w.panes.is_empty() {
             " "
         } else if w.collapsed {
             "▸"
@@ -262,13 +264,12 @@ pub fn list(ctx: &Ctx) -> List {
     let mut groups = Vec::new();
     let mut nodes = Vec::new();
     let mut y = 0;
-    let n = ctx.snap.windows.len();
     for (i, w) in ctx.snap.windows.iter().enumerate() {
         if ctx.rail {
             draw_rail(&mut c, y, ctx, w, &mut nodes);
         } else {
             match variant {
-                Variant::Branches => draw_branches(&mut c, y, ctx, w, i + 1 == n, &mut nodes),
+                Variant::Branches => draw_branches(&mut c, y, ctx, w, &mut nodes),
                 Variant::Blocks => draw_blocks(&mut c, y, ctx, w, &mut nodes),
                 Variant::Map => draw_map(&mut c, y, ctx, w, &mut nodes),
             }
@@ -276,8 +277,7 @@ pub fn list(ctx: &Ctx) -> List {
         groups.push(Group { wid: w.id.clone(), y0: y, y1: y + heights[i] - 1 });
         y += heights[i];
     }
-    let indent = if !ctx.rail && variant == Variant::Branches { 3 } else { 1 };
-    decorate_drag(&mut c, ctx, &groups, &nodes, indent);
+    decorate_drag(&mut c, ctx, &groups, &nodes, 1);
     List { canvas: c, groups, nodes }
 }
 
@@ -316,19 +316,21 @@ fn decorate_drag(c: &mut Canvas<Hit>, ctx: &Ctx, groups: &[Group], nodes: &[(Nod
     }
 }
 
-/// 1a: one row per node, joined by ├─ guides.
-fn draw_branches(c: &mut Canvas<Hit>, y0: u16, ctx: &Ctx, w: &Win, last: bool, nodes: &mut Vec<(NodeKey, u16, u16)>) {
+/// 1a: one row per node. A window row starts with its fold arrow and its
+/// panes hang from below it on ├─ guides. The arrow never touches a guide
+/// sideways: terminals draw box lines at the exact middle of the cell,
+/// fonts put ▸ a little lower, and side by side the difference shows.
+fn draw_branches(c: &mut Canvas<Hit>, y0: u16, ctx: &Ctx, w: &Win, nodes: &mut Vec<(NodeKey, u16, u16)>) {
     let full = ctx.width;
     let end = full.saturating_sub(1);
     let guide = ctx.plain().fg(ctx.pal.guide);
     let look = ctx.win_look(w);
-    c.put(0, y0, if last { " └─" } else { " ├─" }, guide, full);
-    c.fill(3, end, y0, look.base);
-    c.put(4, y0, ctx.chevron(w), look.base.fg(look.sub), end);
-    put_label(c, ctx, w, 6, y0, end.saturating_sub(1), &look);
+    c.fill(1, end, y0, look.base);
+    c.put(1, y0, ctx.chevron(w), look.base.fg(look.sub), end);
+    put_label(c, ctx, w, 3, y0, end.saturating_sub(1), &look);
     c.set_hit(0, full, y0, &Hit::Window(w.id.clone()));
-    if w.panes.len() > 1 {
-        c.set_hit(3, 6, y0, &Hit::Chevron(w.id.clone()));
+    if !w.panes.is_empty() {
+        c.set_hit(0, 3, y0, &Hit::Chevron(w.id.clone()));
     }
     nodes.push((NodeKey::Window(w.id.clone()), y0, y0));
     if !expanded(w, ctx.rail) {
@@ -337,13 +339,12 @@ fn draw_branches(c: &mut Canvas<Hit>, y0: u16, ctx: &Ctx, w: &Win, last: bool, n
     let n = w.panes.len();
     for (i, pane) in w.panes.iter().enumerate() {
         let y = y0 + 1 + i as u16;
-        let g = format!(" {}  {}", if last { ' ' } else { '│' }, if i + 1 == n { "└─" } else { "├─" });
-        c.put(0, y, &g, guide, full);
+        c.put(0, y, if i + 1 == n { " └─" } else { " ├─" }, guide, full);
         let look = ctx.pane_look(w, pane);
-        c.fill(6, end, y, look.base);
+        c.fill(3, end, y, look.base);
         let num = (i + 1).to_string();
-        let x = c.put(7, y, &num, look.base.fg(look.num), end);
-        put_cmd(c, ctx, pane, x.max(8) + 1, y, look.base, end.saturating_sub(1));
+        let x = c.put(4, y, &num, look.base.fg(look.num), end);
+        put_cmd(c, ctx, pane, x.max(5) + 1, y, look.base, end.saturating_sub(1));
         c.set_hit(0, full, y, &Hit::Pane { wid: w.id.clone(), pid: pane.id.clone() });
         nodes.push((NodeKey::Pane(pane.id.clone()), y, y));
     }
@@ -401,7 +402,7 @@ fn draw_blocks(c: &mut Canvas<Hit>, y0: u16, ctx: &Ctx, w: &Win, nodes: &mut Vec
     let x = c.put(x0 + 1, y0, " ", look.base, title_end);
     let x = put_label(c, ctx, w, x, y0, title_end.saturating_sub(1), &look);
     c.put(x, y0, " ", look.base, title_end);
-    if w.panes.len() > 1 {
+    if !w.panes.is_empty() {
         c.put(
             x1 - 3,
             y0,
@@ -531,7 +532,7 @@ fn draw_map(c: &mut Canvas<Hit>, y0: u16, ctx: &Ctx, w: &Win, nodes: &mut Vec<(N
     let chev = end.saturating_sub(2);
     put_label(c, ctx, w, 2, y0, chev.saturating_sub(1), &look);
     c.set_hit(0, full, y0, &Hit::Window(w.id.clone()));
-    if w.panes.len() > 1 {
+    if !w.panes.is_empty() {
         c.put(chev, y0, ctx.chevron(w), look.base.fg(look.sub), end);
         c.set_hit(chev.saturating_sub(1), end, y0, &Hit::Chevron(w.id.clone()));
     }
@@ -820,19 +821,23 @@ mod tests {
         let rows: Vec<String> = (0..l.canvas.h).map(|y| l.canvas.row_text(y).trim_end().to_string()).collect();
         assert_eq!(
             rows,
-            vec![
-                " ├─ ▾ 1:editor*",
-                " │  ├─ 1 nvim",
-                " │  ├─ 2 zsh",
-                " │  └─ 3 zsh",
-                " ├─ ▸ 2:server#",
-                " ├─   3:git-",
-                " └─   4:db!",
-            ]
+            vec![" ▾ 1:editor*", " ├─ 1 nvim", " ├─ 2 zsh", " └─ 3 zsh", " ▸ 2:server#", " ▸ 3:git-", " ▸ 4:db!",]
         );
-        assert_eq!(l.canvas.hit(5, 0), Some(&Hit::Chevron("@1".into())));
+        assert_eq!(l.canvas.hit(1, 0), Some(&Hit::Chevron("@1".into())));
+        assert_eq!(l.canvas.hit(4, 0), Some(&Hit::Window("@1".into())));
         assert_eq!(l.canvas.hit(10, 2), Some(&Hit::Pane { wid: "@1".into(), pid: "%2".into() }));
         assert_eq!(l.groups[0].y1, 3);
+    }
+
+    #[test]
+    fn single_pane_windows_unfold_too() {
+        let mut snap = sample();
+        snap.windows[2].collapsed = false;
+        let pal = theme::light();
+        let l = list(&ctx(&snap, &pal, Variant::Branches, 28));
+        assert_eq!(l.canvas.row_text(5).trim_end(), " ▾ 3:git-");
+        assert_eq!(l.canvas.row_text(6).trim_end(), " └─ 1 lazygit");
+        assert_eq!(l.canvas.hit(1, 5), Some(&Hit::Chevron("@3".into())));
     }
 
     #[test]
@@ -841,7 +846,7 @@ mod tests {
         snap.windows[2].label = Label::parse("3:a-very-long-window-name-indeed");
         let pal = theme::light();
         let l = list(&ctx(&snap, &pal, Variant::Branches, 20));
-        assert_eq!(l.canvas.row_text(5).trim_end(), " ├─   3:a-very-lo…");
+        assert_eq!(l.canvas.row_text(5).trim_end(), " ▸ 3:a-very-long-…");
     }
 
     #[test]
@@ -869,7 +874,7 @@ mod tests {
         assert!(rows.iter().any(|r| r.contains("1 nvim")), "{rows:#?}");
         // Narrow sidebars fall back to branches.
         let narrow = list(&ctx(&snap, &pal, Variant::Map, 20));
-        assert_eq!(narrow.canvas.row_text(1).trim_end(), " │  ├─ 1 nvim");
+        assert_eq!(narrow.canvas.row_text(1).trim_end(), " ├─ 1 nvim");
     }
 
     #[test]
@@ -937,7 +942,7 @@ mod tests {
         let mut c = ctx(&snap, &pal, Variant::Branches, 20);
         c.tip_for = Some(&key);
         list(&c);
-        assert_eq!(c.tip.borrow().clone(), Some(Tip { x: 6, y: 5, text: "3:staging-db-migrations".into() }));
+        assert_eq!(c.tip.borrow().clone(), Some(Tip { x: 3, y: 5, text: "3:staging-db-migrations".into() }));
         // Text that fits needs none.
         let fits = NodeKey::Window("@4".into());
         c.tip_for = Some(&fits);

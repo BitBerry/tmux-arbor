@@ -538,7 +538,7 @@ impl App {
             NodeKey::Window(w) => snap.window(w),
             NodeKey::Pane(_) => None,
         };
-        let foldable = window.is_some_and(|w| !rail && w.panes.len() > 1);
+        let foldable = window.is_some_and(|w| !rail && !w.panes.is_empty());
         let text = self.strings();
         let mut cfg = snap.cfg.clone();
         match k {
@@ -615,11 +615,8 @@ impl App {
     }
 
     fn set_collapsed(&mut self, wid: &str, collapsed: bool) {
-        let r = if collapsed {
-            tmux::run(["set-option", "-w", "-t", wid, "@arbor-collapsed", "1"])
-        } else {
-            tmux::run(["set-option", "-wu", "-t", wid, "@arbor-collapsed"])
-        };
+        // Always explicit: unset means "folded if it has one pane".
+        let r = tmux::run(["set-option", "-w", "-t", wid, "@arbor-collapsed", if collapsed { "1" } else { "0" }]);
         if r.is_ok() {
             if let Some(w) = self.snap.as_mut().and_then(|s| s.window_mut(wid)) {
                 w.collapsed = collapsed;

@@ -5,13 +5,13 @@
 ```
  work          TREE   ◫  ⊟ │
 ────────────────────────────│
- ├─ ▾ 1:editor*             │  nvim …
- │  ├─ 1 nvim               │
- │  ├─ 2 zsh                │
- │  └─ 3 zsh                │
- ├─ ▸ 2:server#             │
- ├─   3:git-                │
- └─   4:db!                 │
+ ▾ 1:editor*                │  nvim …
+ ├─ 1 nvim                  │
+ ├─ 2 zsh                   │
+ └─ 3 zsh                   │
+ ▸ 2:server#                │
+ ▸ 3:git-                   │
+ ▸ 4:db!                    │
                             │
 ────────────────────────────│
  j k 移动 · h l 折叠        │
@@ -49,7 +49,7 @@ run-shell ~/.tmux/plugins/tmux-arbor/arbor.tmux
 | --- | --- |
 | 根 · 当前 session | 标题行显示 session 名和 window 数。用 prefix `(` `)` 切换 session 时整棵树替换。 |
 | 树枝 · window | 文字完全由 tmux 决定：当前 window 用 `window-status-current-format`，其他用 `window-status-format`，格式里的 `#[fg=…]` 样式照样着色。想让树和状态栏不一样，设置 `@arbor-window-format`。 |
-| 叶 · pane | pane 序号 + 正在运行的命令（`pane_current_command`）。只有一个 pane 的 window 不展开。 |
+| 叶 · pane | pane 序号 + 正在运行的命令（`pane_current_command`）。每个 window 行首是折叠箭头 `▸`（折叠）/ `▾`（展开），pane 用 `├─` 连线挂在箭头下面；只有一个 pane 的 window 默认折叠，多个 pane 的默认展开。 |
 | 状态标记 | 来自格式里的 `#F`（`*` 当前、`-` 上一个、`#` activity、`!` bell、`Z` 缩放），不另画图标。 |
 
 侧边栏打开时，状态栏的 `status-format[0]` 换成只含 status-left / status-right 的版本（横排 window 列表交给树），并在最左边加一个 `≡` 按钮；隐藏时恢复原来的状态栏。
@@ -58,7 +58,7 @@ run-shell ~/.tmux/plugins/tmux-arbor/arbor.tmux
 
 三种画法（`@arbor-style`）：
 
-- `branches` 树枝：一行一个节点，`├─` 连线，最紧凑。
+- `branches` 树枝：一行一个节点，pane 用 `├─` 连线挂在 window 下面，最紧凑。
 - `blocks` 线框：每个 window 一个细线框，标题嵌在上边框里。
 - `map` 版图：pane 按真实分屏画成格子，最小的 pane 占一行、整张图最多 6 行；侧边栏窄于 24 列时自动退化成 branches。
 
