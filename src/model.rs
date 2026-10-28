@@ -17,6 +17,8 @@ pub struct PaneInfo {
     pub id: String,
     pub active: bool,
     pub last: bool,
+    /// What the tree shows for the pane: @arbor-pane-format, else the
+    /// running command.
     pub cmd: String,
     pub left: u16,
     pub top: u16,
@@ -31,8 +33,7 @@ pub struct Win {
     pub name: String,
     /// The session's current window.
     pub active: bool,
-    /// Folded in the tree. Unless the user set it, a window with one pane
-    /// starts folded and one with several starts open.
+    /// Folded in the tree; windows start open.
     pub collapsed: bool,
     pub label: Label,
     /// Work panes in index order; sidebars are listed apart.
@@ -69,6 +70,9 @@ pub struct Snapshot {
     pub at_top: bool,
     pub at_bottom: bool,
     pub zoomed: bool,
+    /// Where the sidebar sits in its window.
+    pub pane_left: u16,
+    pub pane_top: u16,
     /// A divider in this window is being dragged with the mouse.
     pub dragging: bool,
     pub windows: Vec<Win>,
@@ -82,6 +86,10 @@ fn join(fields: &[&str]) -> String {
 /// Labels follow tmux: the current window uses window-status-current-format,
 /// the rest window-status-format, unless @arbor-window-format overrides both.
 const LABEL: &str = "#{?#{@arbor-window-format},#{E:@arbor-window-format},#{?window_active,#{E:window-status-current-format},#{E:window-status-format}}}";
+
+/// Pane rows show the running command unless @arbor-pane-format says
+/// otherwise (say, a Claude session's name from the pane title).
+const PANE_LABEL: &str = "#{?#{@arbor-pane-format},#{E:@arbor-pane-format},#{pane_current_command}}";
 
 impl Snapshot {
     pub fn query(pane: &str) -> Result<Snapshot> {
@@ -101,6 +109,8 @@ impl Snapshot {
             "#{pane_at_bottom}",
             "#{window_zoomed_flag}",
             "#{@arbor-drag}",
+            "#{pane_left}",
+            "#{pane_top}",
         ]);
         let o = format!("O{SEP}{}", Config::query_format());
         let w = join(&[
@@ -118,12 +128,12 @@ impl Snapshot {
             "#{pane_id}",
             "#{pane_active}",
             "#{pane_last}",
-            "#{@arbor-sidebar}",
+            crate::tip::KIND,
             "#{pane_left}",
             "#{pane_top}",
             "#{pane_width}",
             "#{pane_height}",
-            "#{pane_current_command}",
+            PANE_LABEL,
         ]);
         let out = tmux::Batch::new()
             .cmd(["display-message", "-p", "-t", pane, &s])
@@ -138,7 +148,6 @@ impl Snapshot {
         let mut snap: Option<Snapshot> = None;
         let mut cfg = Config::default();
         let mut windows: Vec<Win> = Vec::new();
-        let mut folds: Vec<String> = Vec::new();
         let mut panes: Vec<(String, PaneInfo, bool)> = Vec::new();
         let on = |s: &str| s == "1";
         let num = |s: &str| s.parse::<u16>().unwrap_or(0);
@@ -165,6 +174,8 @@ impl Snapshot {
                         at_bottom: on(f[11]),
                         zoomed: on(f[12]),
                         dragging: f.get(13).is_some_and(|d| on(d)),
+                        pane_left: f.get(14).map_or(0, |v| num(v)),
+                        pane_top: f.get(15).map_or(0, |v| num(v)),
                         windows: Vec::new(),
                         cfg: Config::default(),
                     });
@@ -179,13 +190,12 @@ impl Snapshot {
                         id: f[0].into(),
                         index: f[1].parse().unwrap_or(0),
                         active: on(f[2]),
-                        collapsed: false,
+                        collapsed: on(f[3]),
                         name: f[4].into(),
                         label: Label::parse(f[5]),
                         panes: Vec::new(),
                         sidebars: Vec::new(),
                     });
-                    folds.push(f[3].to_string());
                 }
                 "P" => {
                     let f: Vec<&str> = rest.splitn(10, SEP).collect();
@@ -202,7 +212,10 @@ impl Snapshot {
                         height: num(f[8]),
                         cmd: f[9].into(),
                     };
-                    panes.push((f[0].into(), info, on(f[4])));
+                    // A sidebar's popup is not part of the tree.
+                    if f[4] != "tip" {
+                        panes.push((f[0].into(), info, f[4] == "1"));
+                    }
                 }
                 _ => {}
             }
@@ -212,13 +225,6 @@ impl Snapshot {
             if let Some(w) = windows.iter_mut().find(|w| w.id == wid) {
                 if sidebar { w.sidebars.push(info.id) } else { w.panes.push(info) }
             }
-        }
-        for (w, fold) in windows.iter_mut().zip(folds) {
-            w.collapsed = match fold.as_str() {
-                "1" => true,
-                "0" => false,
-                _ => w.panes.len() < 2,
-            };
         }
         snap.windows = windows;
         snap.cfg = cfg;
@@ -279,9 +285,10 @@ impl Snapshot {
     }
 }
 
-/// Whether a window shows its panes: nothing unfolds on the rail.
+/// Whether a window shows its panes. A window with one pane is a leaf and
+/// never unfolds, nor does anything on the rail.
 pub fn expanded(w: &Win, rail: bool) -> bool {
-    !rail && !w.collapsed && !w.panes.is_empty()
+    !rail && !w.collapsed && w.panes.len() > 1
 }
 
 /// The numeric part of a pane id, for ordering duplicate sidebars.
@@ -328,10 +335,8 @@ pub mod tests {
         assert_eq!(editor.panes.len(), 3);
         assert_eq!(editor.sidebars, vec!["%0"]);
         assert_eq!(editor.work_target(), Some("%1"));
-        // Set by the user for server; one-pane windows start folded.
         assert!(snap.windows[1].collapsed);
         assert!(!snap.windows[0].collapsed);
-        assert!(snap.windows[2].collapsed);
         assert_eq!(snap.windows[1].label.plain(), "2:server#");
         assert!(snap.docked(Side::Left));
         assert!(!snap.focused());

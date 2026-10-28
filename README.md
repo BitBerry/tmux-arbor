@@ -10,8 +10,8 @@
  ├─ 2 zsh                   │
  └─ 3 zsh                   │
  ▸ 2:server#                │
- ▸ 3:git-                   │
- ▸ 4:db!                    │
+ ∙ 3:git-                   │
+ ∙ 4:db!                    │
                             │
 ────────────────────────────│
  j k 移动 · h l 折叠        │
@@ -49,7 +49,7 @@ run-shell ~/.tmux/plugins/tmux-arbor/arbor.tmux
 | --- | --- |
 | 根 · 当前 session | 标题行显示 session 名和 window 数。用 prefix `(` `)` 切换 session 时整棵树替换。 |
 | 树枝 · window | 文字完全由 tmux 决定：当前 window 用 `window-status-current-format`，其他用 `window-status-format`，格式里的 `#[fg=…]` 样式照样着色。想让树和状态栏不一样，设置 `@arbor-window-format`。 |
-| 叶 · pane | pane 序号 + 正在运行的命令（`pane_current_command`）。每个 window 行首是折叠箭头 `▸`（折叠）/ `▾`（展开），pane 用 `├─` 连线挂在箭头下面；只有一个 pane 的 window 默认折叠，多个 pane 的默认展开。 |
+| 叶 · pane | pane 序号 + 正在运行的命令（`pane_current_command`），可用 `@arbor-pane-format` 换成别的格式。有多个 pane 的 window 行首是折叠箭头 `▸`（折叠）/ `▾`（展开），pane 用 `├─` 连线挂在箭头下面；只有一个 pane 的 window 不展开，行首是一个小圆点 `∙`。 |
 | 状态标记 | 来自格式里的 `#F`（`*` 当前、`-` 上一个、`#` activity、`!` bell、`Z` 缩放），不另画图标。 |
 
 侧边栏打开时，状态栏的 `status-format[0]` 换成只含 status-left / status-right 的版本（横排 window 列表交给树），并在最左边加一个 `≡` 按钮；隐藏时恢复原来的状态栏。
@@ -62,7 +62,7 @@ run-shell ~/.tmux/plugins/tmux-arbor/arbor.tmux
 - `blocks` 线框：每个 window 一个细线框，标题嵌在上边框里。
 - `map` 版图：pane 按真实分屏画成格子，最小的 pane 占一行、整张图最多 6 行；侧边栏窄于 24 列时自动退化成 branches。
 
-被截断的 window 名或 pane 命令，鼠标停在上面时立刻浮出一个深色标签显示全文；侧边栏放不下时标签往左挪，再放不下就换行。
+被截断的 window 名或 pane 文字，鼠标停在上面（或树有焦点时光标在那一行）时，会在同一行、侧边栏外侧弹出一个单行的深色标签显示全文（tmux ≥ 3.8，用浮动 pane 实现，不抢焦点）。更早的 tmux 没有浮动 pane，改为原地滚动：约 0.35 秒后开始，每列约 70ms，到头稍停再滚回来。
 
 ## 分割
 
@@ -130,7 +130,7 @@ prefix 快捷键不抢焦点，随时可用；聚焦侧边栏后进入 vim 风�
 | 状态栏 `≡` | 显示 / 隐藏 | `arbor toggle` |
 | 单击 `◫` / `⊟` | 分割工作区的当前 pane | 你自己的 `split-window` 绑定 |
 | 悬停在 `◫` / `⊟` 上 | 提示分割方向和你的按键 | |
-| 悬停在被截断的名字上 | 浮出全文 | |
+| 悬停在被截断的名字上 | 侧边栏外侧弹出单行全文（旧版 tmux：原地滚动） | `new-pane -d -B none`（浮动 pane） |
 
 ## 配置
 
@@ -140,6 +140,7 @@ set -g window-status-format         '#I:#W#F'
 set -g window-status-current-format '#I:#W#F'
 
 set -g @arbor-window-format         ''          # 留空 = 跟随 tmux
+set -g @arbor-pane-format           ''          # pane 行的文字；留空 = 正在运行的命令
 set -g @arbor-hide-status-windows   on          # 打开时去掉状态栏 window 列表
 set -g @arbor-status-button         on          # 状态栏最左边的 ≡ 按钮
 set -g @arbor-position              'left'      # left | right
@@ -178,7 +179,8 @@ arbor uninstall      # 关掉所有侧边栏，恢复状态栏、按键和 hook
 - 刷新由 hook 驱动（`session-window-changed`、`window-pane-changed`、`window-layout-changed`、`window-renamed`、`pane-exited` 等），hook 用信号通知各侧边栏。tmux 没有"pane 里的命令变了"这个事件，所以侧边栏**可见时**每 `@arbor-interval` 秒查一次 pane 命令，没变化不重画。
 - 树内的点击和拖拽由 arbor 自己读鼠标事件（SGR 1006）。分隔线拖动是 tmux 原生 resize：插件包了 `MouseDrag1Border` 给 window 打上 `@arbor-drag` 标记，拖动中侧边栏只跟随鼠标、实时显示会落到的宽度，松手（`MouseDragEnd1Border` / `MouseDragEnd1Pane`，后者在没有标记时照常把事件交给 pane）时再吸附成窄条或隐藏并记住宽度。没有这个标记的宽度变化——`prefix 空格` 换布局、`rotate-window`、`swap-pane`、分屏、终端缩放——都会让侧边栏回到原宽度、贴回原侧。
 - 你的 `split-window` 绑定被包了一层 `if-shell -F '#{@arbor-sidebar}'`：只有当前 pane 是侧边栏时才改由 arbor 处理，原始绑定存在 `@arbor-splits`，`arbor uninstall` 会原样恢复。
-- tmux 不会告诉 pane"鼠标移走了"，所以悬停高亮和提示在最后一次鼠标移动后 3 秒消失；如果最后一次移动是在朝工作区的那一列，0.3 秒就消失。滚轮也会把它们收起。
+- tmux 不会告诉 pane"鼠标移走了"，所以悬停高亮和提示在最后一次鼠标移动后 3 秒消失（弹出的全文停留 5 秒，正在滚动的名字至少滚完一个来回）；如果最后一次移动是在朝工作区的那一列，0.3 秒就消失。滚轮也会把它们收起。
+- 弹出的全文是一个标题为 `arbor-tip` 的浮动 pane，跑着 `arbor tip`；它放在侧边栏外面，因为浮动 pane 会截走它上方的鼠标事件。树和各种命令都会忽略它，打开它的侧边栏退出时它也跟着退出。
 - 焦点在树上时 window 不会被 automatic-rename 改名成 `arbor`。
 - 窗口里最后一个 shell 退出后，侧边栏也随之退出，window 正常关闭。
 

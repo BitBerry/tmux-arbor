@@ -44,6 +44,8 @@ const NOTIFY_HOOKS: &[&str] = &[
     "alert-bell",
     "alert-silence",
     "session-renamed",
+    // Pane rows may show a title (@arbor-pane-format).
+    "pane-title-changed",
 ];
 const THEME_HOOKS: &[&str] = &["client-light-theme", "client-dark-theme"];
 
@@ -87,6 +89,7 @@ pub fn run(args: &[String]) -> Result<()> {
         Some("border-dblclick") => border_dblclick(arg(1)),
         Some("split") => split::run(arg(1), arg(2)),
         Some("drag-end") => drag_end(arg(1)),
+        Some("tip") => crate::tip::run(),
         Some("uninstall") => uninstall(),
         Some("version" | "--version" | "-V") => {
             println!("arbor {}", env!("CARGO_PKG_VERSION"));
@@ -105,6 +108,8 @@ pub struct PaneRow {
     pub window: String,
     pub pane: String,
     pub sidebar: bool,
+    /// A sidebar's popup (see tip.rs): neither sidebar nor work pane.
+    pub tip: bool,
     /// Published by the sidebar process once it can take signals.
     pub pid: Option<i32>,
     pub active: bool,
@@ -134,7 +139,7 @@ fn row_format() -> String {
     [
         "#{window_id}",
         "#{pane_id}",
-        "#{@arbor-sidebar}",
+        crate::tip::KIND,
         "#{@arbor-pid}",
         "#{pane_active}",
         "#{pane_last}",
@@ -162,7 +167,8 @@ fn parse_rows(out: &str) -> Vec<PaneRow> {
             Some(PaneRow {
                 window: f[0].into(),
                 pane: f[1].into(),
-                sidebar: on(f[2]),
+                sidebar: f[2] == "1",
+                tip: f[2] == "tip",
                 pid: f[3].parse().ok(),
                 active: on(f[4]),
                 last: on(f[5]),
@@ -194,7 +200,7 @@ fn sidebars(rows: &[PaneRow]) -> impl Iterator<Item = &PaneRow> {
 
 /// The work pane a sidebar should split from or hand focus to.
 pub fn work_pane<'a>(rows: &'a [PaneRow], window: &str) -> Option<&'a PaneRow> {
-    let work = || rows.iter().filter(move |r| r.window == window && !r.sidebar);
+    let work = || rows.iter().filter(move |r| r.window == window && !r.sidebar && !r.tip);
     work().find(|r| r.active).or_else(|| work().find(|r| r.last)).or_else(|| work().next())
 }
 

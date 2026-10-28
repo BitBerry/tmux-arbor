@@ -2,11 +2,14 @@
 //! (branches, blocks, map) or as the 7-column rail, plus the header and
 //! footer around the list.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::time::Duration;
 
 use crate::config::{MAP_MIN, Variant};
 use crate::model::{NodeKey, PaneInfo, Snapshot, Win, expanded};
-use crate::screen::{BOLD, Canvas, Color, DIM, OVERLINE, Style, UNDER_DASHED, UNDERLINE, take_width, truncate, width};
+use crate::screen::{
+    BOLD, Canvas, Color, DIM, OVERLINE, Style, UNDER_DASHED, UNDERLINE, skip_width, take_width, truncate, width,
+};
 use crate::strings::Strings;
 use crate::theme::Palette;
 
@@ -66,16 +69,20 @@ pub struct Ctx<'a> {
     /// The split button under the pointer.
     pub hover_split: Option<char>,
     pub drag: Option<&'a Drag>,
-    /// The hovered node: if its text is cut off, a tooltip shows all of it.
+    /// The node whose cut-off text scrolls, and for how long it has.
+    pub marquee: Option<(&'a NodeKey, Duration)>,
+    /// Set while drawing: how many columns the marquee text overflows by.
+    pub overflow: Cell<Option<u16>>,
+    /// The node whose cut-off text a popup shows whole, when tmux can
+    /// float one (instead of the marquee).
     pub tip_for: Option<&'a NodeKey>,
     /// Set while drawing: where that cut-off text sits, and all of it.
     pub tip: RefCell<Option<Tip>>,
 }
 
-/// Cut-off text under the pointer, in list coordinates.
+/// Cut-off text the popup shows, in list coordinates.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Tip {
-    pub x: u16,
     pub y: u16,
     pub text: String,
 }
@@ -178,34 +185,93 @@ impl Ctx<'_> {
         look
     }
 
-    /// Records the tooltip when `key` is hovered and its text, drawn at
-    /// (x, y), does not fit in `avail` columns.
-    fn note_cut(&self, key: &NodeKey, x: u16, y: u16, text: impl FnOnce() -> String, total: usize, avail: usize) {
+    /// Notes the popup when `key` wants one and its text, on row `y`, does
+    /// not fit in `avail` columns.
+    fn note_cut(&self, key: &NodeKey, y: u16, text: impl FnOnce() -> String, total: usize, avail: usize) {
         if self.tip_for == Some(key) && total > avail {
-            *self.tip.borrow_mut() = Some(Tip { x, y, text: text() });
+            *self.tip.borrow_mut() = Some(Tip { y, text: text() });
         }
     }
 
-    /// Small triangles: unlike ▶ ▼ (and the box-drawing guides) they are
-    /// not East Asian ambiguous width, so they take one column everywhere.
-    fn chevron(&self, w: &Win) -> &'static str {
-        if self.rail || w.panes.is_empty() {
-            " "
+    /// Columns to scroll `key`'s text by, when it is the marquee and its
+    /// `total` columns do not fit in `avail`.
+    fn scroll(&self, key: &NodeKey, total: usize, avail: usize) -> Option<usize> {
+        let (k, elapsed) = self.marquee?;
+        if k != key || total <= avail {
+            return None;
+        }
+        let dist = total - avail;
+        self.overflow.set(Some(dist as u16));
+        Some(marquee_offset(dist, elapsed))
+    }
+
+    /// The fold arrow of a window with several panes. Small triangles:
+    /// unlike ▶ ▼ (and the box-drawing guides) they are not East Asian
+    /// ambiguous width, so they take one column everywhere.
+    fn chevron(&self, w: &Win) -> Option<&'static str> {
+        if self.rail || w.panes.len() < 2 {
+            None
         } else if w.collapsed {
-            "▸"
+            Some("▸")
         } else {
-            "▾"
+            Some("▾")
         }
     }
 }
 
+/// Marquee timing: a short pause at each end, then about 14 columns a
+/// second at an even pace, so a cut-off name starts moving almost at once.
+const MARQUEE_HOLD: f64 = 350.0;
+const MARQUEE_COL: f64 = 70.0;
+
+fn marquee_travel(dist: usize) -> f64 {
+    (dist as f64 * MARQUEE_COL).max(1.0)
+}
+
+/// One full cycle: out, pause, back, pause.
+pub fn marquee_cycle(dist: u16) -> Duration {
+    Duration::from_millis((2.0 * (marquee_travel(dist as usize) + 2.0 * MARQUEE_HOLD)) as u64)
+}
+
+/// Columns scrolled `elapsed` into a back-and-forth marquee over `dist`.
+pub fn marquee_offset(dist: usize, elapsed: Duration) -> usize {
+    let travel = marquee_travel(dist);
+    let pass = travel + 2.0 * MARQUEE_HOLD;
+    let t = elapsed.as_secs_f64() * 1000.0 % (2.0 * pass);
+    let t = if t > pass { 2.0 * pass - t } else { t };
+    (((t - MARQUEE_HOLD) / travel).clamp(0.0, 1.0) * dist as f64).round() as usize
+}
+
+/// Writes `spans` from `x` with their first `skip` columns scrolled away,
+/// clipped at `limit`.
+fn put_scrolled(c: &mut Canvas<Hit>, x: u16, y: u16, spans: &[(String, Style)], skip: usize, limit: u16) -> u16 {
+    let mut x = x;
+    let mut skip = skip;
+    for (s, st) in spans {
+        let w = width(s);
+        if skip >= w {
+            skip -= w;
+            continue;
+        }
+        let (pad, rest) = skip_width(s, skip);
+        skip = 0;
+        x = c.put(x, y, &" ".repeat(pad), *st, limit);
+        x = c.put(x, y, rest, *st, limit);
+    }
+    x
+}
+
 /// Writes a window's label from `x`, cut with "…" so it ends before
-/// `limit`.
+/// `limit`, or scrolling when it is the marquee.
 fn put_label(c: &mut Canvas<Hit>, ctx: &Ctx, w: &Win, x: u16, y: u16, limit: u16, look: &Look) -> u16 {
     let spans = if look.plain { vec![(w.label.plain(), look.base)] } else { w.label.spans(look.base) };
     let avail = limit.saturating_sub(x) as usize;
     let total: usize = spans.iter().map(|(s, _)| width(s)).sum();
-    ctx.note_cut(&NodeKey::Window(w.id.clone()), x, y, || w.label.plain(), total, avail);
+    let key = NodeKey::Window(w.id.clone());
+    ctx.note_cut(&key, y, || w.label.plain(), total, avail);
+    if let Some(skip) = ctx.scroll(&key, total, avail) {
+        return put_scrolled(c, x, y, &spans, skip, limit);
+    }
     let mut x = x;
     if total <= avail {
         for (s, st) in &spans {
@@ -234,11 +300,15 @@ fn put_text(c: &mut Canvas<Hit>, x: u16, y: u16, s: &str, style: Style, limit: u
     c.put(x, y, &truncate(s, limit.saturating_sub(x) as usize), style, limit)
 }
 
-/// A pane's command, cut with "…".
+/// A pane's text: cut with "…", or scrolling when it is the marquee.
 fn put_cmd(c: &mut Canvas<Hit>, ctx: &Ctx, pane: &PaneInfo, x: u16, y: u16, style: Style, limit: u16) -> u16 {
     let key = NodeKey::Pane(pane.id.clone());
-    ctx.note_cut(&key, x, y, || pane.cmd.clone(), width(&pane.cmd), limit.saturating_sub(x) as usize);
-    put_text(c, x, y, &pane.cmd, style, limit)
+    let (total, avail) = (width(&pane.cmd), limit.saturating_sub(x) as usize);
+    ctx.note_cut(&key, y, || pane.cmd.clone(), total, avail);
+    match ctx.scroll(&key, total, avail) {
+        Some(skip) => put_scrolled(c, x, y, &[(pane.cmd.clone(), style)], skip, limit),
+        None => put_text(c, x, y, &pane.cmd, style, limit),
+    }
 }
 
 fn win_height(ctx: &Ctx, variant: Variant, w: &Win) -> u16 {
@@ -316,6 +386,10 @@ fn decorate_drag(c: &mut Canvas<Hit>, ctx: &Ctx, groups: &[Group], nodes: &[(Nod
     }
 }
 
+/// Marks a window with one pane in the arrow column. Not East Asian
+/// ambiguous width either.
+const LEAF: &str = "∙";
+
 /// 1a: one row per node. A window row starts with its fold arrow and its
 /// panes hang from below it on ├─ guides. The arrow never touches a guide
 /// sideways: terminals draw box lines at the exact middle of the cell,
@@ -326,10 +400,11 @@ fn draw_branches(c: &mut Canvas<Hit>, y0: u16, ctx: &Ctx, w: &Win, nodes: &mut V
     let guide = ctx.plain().fg(ctx.pal.guide);
     let look = ctx.win_look(w);
     c.fill(1, end, y0, look.base);
-    c.put(1, y0, ctx.chevron(w), look.base.fg(look.sub), end);
+    // A one-pane window is a leaf: a dot holds the arrow's place.
+    c.put(1, y0, ctx.chevron(w).unwrap_or(LEAF), look.base.fg(look.sub), end);
     put_label(c, ctx, w, 3, y0, end.saturating_sub(1), &look);
     c.set_hit(0, full, y0, &Hit::Window(w.id.clone()));
-    if !w.panes.is_empty() {
+    if ctx.chevron(w).is_some() {
         c.set_hit(0, 3, y0, &Hit::Chevron(w.id.clone()));
     }
     nodes.push((NodeKey::Window(w.id.clone()), y0, y0));
@@ -402,14 +477,8 @@ fn draw_blocks(c: &mut Canvas<Hit>, y0: u16, ctx: &Ctx, w: &Win, nodes: &mut Vec
     let x = c.put(x0 + 1, y0, " ", look.base, title_end);
     let x = put_label(c, ctx, w, x, y0, title_end.saturating_sub(1), &look);
     c.put(x, y0, " ", look.base, title_end);
-    if !w.panes.is_empty() {
-        c.put(
-            x1 - 3,
-            y0,
-            &format!(" {} ", ctx.chevron(w)),
-            frame.fg(if w.active { p.cur_win_sub } else { p.muted }),
-            x1,
-        );
+    if let Some(chev) = ctx.chevron(w) {
+        c.put(x1 - 3, y0, &format!(" {chev} "), frame.fg(if w.active { p.cur_win_sub } else { p.muted }), x1);
         c.set_hit(x1 - 3, x1, y0, &Hit::Chevron(w.id.clone()));
     }
     nodes.push((key, y0, y0));
@@ -532,8 +601,8 @@ fn draw_map(c: &mut Canvas<Hit>, y0: u16, ctx: &Ctx, w: &Win, nodes: &mut Vec<(N
     let chev = end.saturating_sub(2);
     put_label(c, ctx, w, 2, y0, chev.saturating_sub(1), &look);
     c.set_hit(0, full, y0, &Hit::Window(w.id.clone()));
-    if !w.panes.is_empty() {
-        c.put(chev, y0, ctx.chevron(w), look.base.fg(look.sub), end);
+    if let Some(arrow) = ctx.chevron(w) {
+        c.put(chev, y0, arrow, look.base.fg(look.sub), end);
         c.set_hit(chev.saturating_sub(1), end, y0, &Hit::Chevron(w.id.clone()));
     }
     nodes.push((NodeKey::Window(w.id.clone()), y0, y0));
@@ -808,6 +877,8 @@ mod tests {
             hover: None,
             hover_split: None,
             drag: None,
+            marquee: None,
+            overflow: Cell::new(None),
             tip_for: None,
             tip: RefCell::new(None),
         }
@@ -821,7 +892,7 @@ mod tests {
         let rows: Vec<String> = (0..l.canvas.h).map(|y| l.canvas.row_text(y).trim_end().to_string()).collect();
         assert_eq!(
             rows,
-            vec![" ▾ 1:editor*", " ├─ 1 nvim", " ├─ 2 zsh", " └─ 3 zsh", " ▸ 2:server#", " ▸ 3:git-", " ▸ 4:db!",]
+            vec![" ▾ 1:editor*", " ├─ 1 nvim", " ├─ 2 zsh", " └─ 3 zsh", " ▸ 2:server#", " ∙ 3:git-", " ∙ 4:db!",]
         );
         assert_eq!(l.canvas.hit(1, 0), Some(&Hit::Chevron("@1".into())));
         assert_eq!(l.canvas.hit(4, 0), Some(&Hit::Window("@1".into())));
@@ -830,14 +901,16 @@ mod tests {
     }
 
     #[test]
-    fn single_pane_windows_unfold_too() {
-        let mut snap = sample();
-        snap.windows[2].collapsed = false;
+    fn one_pane_windows_are_leaves() {
+        let snap = sample();
         let pal = theme::light();
         let l = list(&ctx(&snap, &pal, Variant::Branches, 28));
-        assert_eq!(l.canvas.row_text(5).trim_end(), " ▾ 3:git-");
-        assert_eq!(l.canvas.row_text(6).trim_end(), " └─ 1 lazygit");
-        assert_eq!(l.canvas.hit(1, 5), Some(&Hit::Chevron("@3".into())));
+        // No arrow to click and nothing below.
+        assert_eq!(l.canvas.row_text(5).trim_end(), " ∙ 3:git-");
+        assert_eq!(l.canvas.row_text(6).trim_end(), " ∙ 4:db!");
+        assert_eq!(l.canvas.hit(1, 5), Some(&Hit::Window("@3".into())));
+        let blocks = list(&ctx(&snap, &pal, Variant::Blocks, 24));
+        assert_eq!(blocks.canvas.row_text(7), " ┌ 3:git- ────────────┐ ");
     }
 
     #[test]
@@ -846,7 +919,7 @@ mod tests {
         snap.windows[2].label = Label::parse("3:a-very-long-window-name-indeed");
         let pal = theme::light();
         let l = list(&ctx(&snap, &pal, Variant::Branches, 20));
-        assert_eq!(l.canvas.row_text(5).trim_end(), " ▸ 3:a-very-long-…");
+        assert_eq!(l.canvas.row_text(5).trim_end(), " ∙ 3:a-very-long-…");
     }
 
     #[test]
@@ -934,7 +1007,31 @@ mod tests {
     }
 
     #[test]
-    fn hovered_cut_text_gets_a_tooltip() {
+    fn marquee_scrolls_a_cut_label() {
+        let mut snap = sample();
+        snap.windows[2].label = Label::parse("3:staging-db-migrations");
+        let pal = theme::light();
+        let key = NodeKey::Window("@3".into());
+        let mut c = ctx(&snap, &pal, Variant::Branches, 20);
+        // At first it holds at the start, with nothing cut off by "…".
+        c.marquee = Some((&key, Duration::ZERO));
+        assert_eq!(list(&c).canvas.row_text(5).trim_end(), " ∙ 3:staging-db-mi");
+        assert_eq!(c.overflow.get(), Some(8));
+        // Then it moves a column every 70ms, and reaches the end.
+        c.marquee = Some((&key, Duration::from_millis(350 + 3 * 70)));
+        assert_eq!(list(&c).canvas.row_text(5).trim_end(), " ∙ taging-db-migra");
+        c.marquee = Some((&key, Duration::from_millis(350 + 8 * 70 + 10)));
+        assert_eq!(list(&c).canvas.row_text(5).trim_end(), " ∙ g-db-migrations");
+        // Another node's label is cut as usual.
+        let other = NodeKey::Window("@4".into());
+        c.marquee = Some((&other, Duration::ZERO));
+        c.overflow.set(None);
+        assert_eq!(list(&c).canvas.row_text(5).trim_end(), " ∙ 3:staging-db-m…");
+        assert_eq!(c.overflow.get(), None);
+    }
+
+    #[test]
+    fn cut_text_is_noted_for_the_popup() {
         let mut snap = sample();
         snap.windows[2].label = Label::parse("3:staging-db-migrations");
         let pal = theme::light();
@@ -942,13 +1039,24 @@ mod tests {
         let mut c = ctx(&snap, &pal, Variant::Branches, 20);
         c.tip_for = Some(&key);
         list(&c);
-        assert_eq!(c.tip.borrow().clone(), Some(Tip { x: 3, y: 5, text: "3:staging-db-migrations".into() }));
+        assert_eq!(c.tip.borrow().clone(), Some(Tip { y: 5, text: "3:staging-db-migrations".into() }));
         // Text that fits needs none.
         let fits = NodeKey::Window("@4".into());
         c.tip_for = Some(&fits);
         *c.tip.borrow_mut() = None;
         list(&c);
         assert_eq!(*c.tip.borrow(), None);
+    }
+
+    #[test]
+    fn marquee_goes_out_and_back() {
+        assert_eq!(marquee_offset(10, Duration::ZERO), 0);
+        assert_eq!(marquee_offset(10, Duration::from_millis(300)), 0);
+        assert_eq!(marquee_offset(10, Duration::from_millis(350 + 350)), 5);
+        let pass = 350 + 700 + 350;
+        assert_eq!(marquee_offset(10, Duration::from_millis(pass - 100)), 10);
+        assert_eq!(marquee_offset(10, Duration::from_millis(2 * pass - 100)), 0);
+        assert_eq!(marquee_cycle(10), Duration::from_millis(2 * pass));
     }
 
     #[test]

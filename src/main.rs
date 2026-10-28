@@ -13,6 +13,7 @@ mod status;
 mod strings;
 mod term;
 mod theme;
+mod tip;
 mod tmux;
 mod view;
 

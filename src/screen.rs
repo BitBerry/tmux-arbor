@@ -69,6 +69,13 @@ impl Style {
         self
     }
 
+    /// The escape sequence that selects this style.
+    pub fn sgr(&self) -> String {
+        let mut s = String::new();
+        self.write_sgr(&mut s);
+        s
+    }
+
     fn write_sgr(&self, out: &mut String) {
         out.push_str("\x1b[0");
         for (bit, code) in
@@ -242,25 +249,28 @@ impl<H: Clone + Default> Canvas<H> {
         }
     }
 
-    /// The whole frame as one synchronized-update write.
-    pub fn encode(&self, out: &mut String) {
-        out.push_str("\x1b[?2026h");
-        let mut cur: Option<Style> = None;
-        for y in 0..self.h {
-            let _ = write!(out, "\x1b[{};1H", y + 1);
-            for x in 0..self.w {
-                let c = &self.cells[y as usize * self.w as usize + x as usize];
-                if c.text.is_empty() {
-                    continue;
+    /// Each row as a self-contained escape sequence (it positions the
+    /// cursor and sets its own styles), so rows can be compared between
+    /// frames and only the changed ones written.
+    pub fn encode_rows(&self) -> Vec<String> {
+        (0..self.h)
+            .map(|y| {
+                let mut out = format!("\x1b[{};1H", y + 1);
+                let mut cur: Option<Style> = None;
+                for x in 0..self.w {
+                    let c = &self.cells[y as usize * self.w as usize + x as usize];
+                    if c.text.is_empty() {
+                        continue;
+                    }
+                    if cur != Some(c.style) {
+                        c.style.write_sgr(&mut out);
+                        cur = Some(c.style);
+                    }
+                    out.push_str(&c.text);
                 }
-                if cur != Some(c.style) {
-                    c.style.write_sgr(out);
-                    cur = Some(c.style);
-                }
-                out.push_str(&c.text);
-            }
-        }
-        out.push_str("\x1b[0m\x1b[?2026l");
+                out
+            })
+            .collect()
     }
 
     /// One row as plain text, for tests and debugging.
@@ -285,6 +295,19 @@ pub fn truncate(s: &str, max: usize) -> String {
     let mut out = take_width(s, max - 1).to_string();
     out.push('…');
     out
+}
+
+/// Drops the first `n` columns of `s`. Returns the rest and how many blank
+/// columns stand in for a wide character cut in half.
+pub fn skip_width(s: &str, n: usize) -> (usize, &str) {
+    let mut w = 0;
+    for (i, ch) in s.char_indices() {
+        if w >= n {
+            return (w - n, &s[i..]);
+        }
+        w += ch.width().unwrap_or(0);
+    }
+    (w.saturating_sub(n), "")
 }
 
 /// The longest prefix of `s` that fits in `max` columns.
@@ -321,6 +344,14 @@ mod tests {
         assert_eq!(c.put(0, 0, "abcdef", Style::default(), 4), 4);
         assert_eq!(c.row_text(0), "abcd    ");
         assert_eq!(c.put(3, 0, "窗", Style::default(), 4), 3);
+    }
+
+    #[test]
+    fn skipping_columns() {
+        assert_eq!(skip_width("abcdef", 2), (0, "cdef"));
+        assert_eq!(skip_width("窗口ab", 1), (1, "口ab"));
+        assert_eq!(skip_width("窗口ab", 4), (0, "ab"));
+        assert_eq!(skip_width("ab", 5), (0, ""));
     }
 
     #[test]

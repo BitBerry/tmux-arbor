@@ -3,7 +3,7 @@
 //! it (SIGUSR1), re-detects the theme on SIGUSR2, and handles its own
 //! resizes on SIGWINCH.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::io::{self, Read};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
@@ -16,11 +16,12 @@ use crate::config::{Config, HIDE_BELOW, MAX_W, MIN_FULL, Mode, Side, Theme};
 use crate::input::{Event, Key, Mouse, MouseKind, Parser};
 use crate::label::parse_color;
 use crate::model::{NodeKey, Snapshot, expanded, pane_number};
-use crate::screen::Canvas;
+use crate::screen::{Canvas, truncate, width};
 use crate::split;
 use crate::strings::{Strings, wrap};
 use crate::term;
 use crate::theme::{self, Palette};
+use crate::tip;
 use crate::tmux::{self, Batch};
 use crate::view::{self, Ctx, Drag, Footer, Group, Hit, Target};
 
@@ -35,6 +36,10 @@ const MESSAGE_TIME: Duration = Duration::from_millis(1600);
 /// the edge facing the work area.
 const HOVER_IDLE: Duration = Duration::from_secs(3);
 const HOVER_EDGE: Duration = Duration::from_millis(300);
+/// How long a popup stays up after the pointer last moved over its name.
+const POPUP_IDLE: Duration = Duration::from_secs(5);
+/// Frame interval while a cut-off name scrolls (it moves every 70ms).
+const MARQUEE_FRAME: Duration = Duration::from_millis(35);
 /// A drag whose end tmux never reported (released off any border or pane)
 /// is finished after this long without movement.
 const DRAG_STALE: Duration = Duration::from_secs(2);
@@ -108,6 +113,19 @@ struct App {
     hover: Option<NodeKey>,
     hover_split: Option<char>,
     hover_until: Option<Instant>,
+    last_motion: Option<Instant>,
+    /// The last motion was on the edge facing the work area.
+    hover_edge: bool,
+    /// The node whose cut-off text scrolls, and since when.
+    marquee: Option<(NodeKey, Instant)>,
+    /// tmux can float panes: cut-off names get a popup, not a marquee.
+    floating: bool,
+    /// The open popup's pane, and what it shows.
+    popup: Option<(String, tip::Popup)>,
+    /// The rows written last frame; only rows that differ are written, to
+    /// keep a sidebar over a slow ssh link from resending the whole tree.
+    last_rows: Vec<String>,
+    anim_at: Option<Instant>,
     /// A node to scroll into view on the next frame.
     reveal: Option<NodeKey>,
     scroll: u16,
@@ -142,6 +160,7 @@ pub fn run() -> Result<()> {
     let _ = tmux::run(["set-option", "-p", "-t", &pane, "remain-on-exit", "off"]);
     let _raw = term::Raw::enter()?;
     let mut app = App::new(pane);
+    app.floating = tip::supported();
     // Give tmux a moment to report the background before the first frame.
     term::write(term::QUERY_BG)?;
     app.read_input(Some(Duration::from_millis(60)))?;
@@ -162,6 +181,13 @@ impl App {
             hover: None,
             hover_split: None,
             hover_until: None,
+            last_motion: None,
+            hover_edge: false,
+            marquee: None,
+            floating: false,
+            popup: None,
+            last_rows: Vec::new(),
+            anim_at: None,
             reveal: None,
             scroll: 0,
             press: None,
@@ -191,6 +217,7 @@ impl App {
                 self.esc_at,
                 self.tick_at,
                 self.hover_until,
+                self.anim_at,
                 self.msg.as_ref().map(|m| m.1),
             ]
             .into_iter()
@@ -216,6 +243,8 @@ impl App {
             }
             if drain(&sig.winch) {
                 self.size = term::size();
+                // tmux reflows the pane on resize: write every row again.
+                self.last_rows.clear();
                 self.resize_at = Some(Instant::now() + RESIZE_SETTLE);
                 // Still moving: not a drag tmux forgot to end.
                 if self.drag_check_at.is_some() {
@@ -232,6 +261,7 @@ impl App {
             }
             self.run_timers();
         }
+        self.sync_popup(None);
         Ok(())
     }
 
@@ -262,6 +292,10 @@ impl App {
         }
         if due(self.msg.as_ref().map(|m| m.1)) {
             self.msg = None;
+            self.draw();
+        }
+        if due(self.anim_at) {
+            self.anim_at = None;
             self.draw();
         }
         if due(self.hover_until) {
@@ -415,12 +449,18 @@ impl App {
     fn refresh(&mut self) {
         self.refresh_at = None;
         let Some(snap) = self.query() else { return };
+        // Hooks fire for things the tree does not show (a popup opening,
+        // say); redraw only when something it shows changed.
+        let focused = self.focused();
+        let changed = self.snap.as_ref() != Some(&snap);
         self.apply(snap);
         if self.quit {
             return;
         }
         self.fix_geometry();
-        self.draw();
+        if changed || self.focused() != focused {
+            self.draw();
+        }
     }
 
     /// The periodic check for changed pane commands; redraws only on change.
@@ -538,7 +578,7 @@ impl App {
             NodeKey::Window(w) => snap.window(w),
             NodeKey::Pane(_) => None,
         };
-        let foldable = window.is_some_and(|w| !rail && !w.panes.is_empty());
+        let foldable = window.is_some_and(|w| !rail && w.panes.len() > 1);
         let text = self.strings();
         let mut cfg = snap.cfg.clone();
         match k {
@@ -615,8 +655,11 @@ impl App {
     }
 
     fn set_collapsed(&mut self, wid: &str, collapsed: bool) {
-        // Always explicit: unset means "folded if it has one pane".
-        let r = tmux::run(["set-option", "-w", "-t", wid, "@arbor-collapsed", if collapsed { "1" } else { "0" }]);
+        let r = if collapsed {
+            tmux::run(["set-option", "-w", "-t", wid, "@arbor-collapsed", "1"])
+        } else {
+            tmux::run(["set-option", "-wu", "-t", wid, "@arbor-collapsed"])
+        };
         if r.is_ok() {
             if let Some(w) = self.snap.as_mut().and_then(|s| s.window_mut(wid)) {
                 w.collapsed = collapsed;
@@ -777,7 +820,10 @@ impl App {
                     Side::Left => m.x + 1 >= self.size.0,
                     Side::Right => m.x == 0,
                 };
-                self.hover_until = Some(Instant::now() + if edge { HOVER_EDGE } else { HOVER_IDLE });
+                let now = Instant::now();
+                self.hover_until = Some(now + if edge { HOVER_EDGE } else { HOVER_IDLE });
+                self.last_motion = Some(now);
+                self.hover_edge = edge;
                 if hover != self.hover || hover_split != self.hover_split {
                     self.hover = hover;
                     self.hover_split = hover_split;
@@ -959,14 +1005,72 @@ impl App {
         }
     }
 
+    /// What scrolls: the hovered node, else the keyboard cursor; nothing
+    /// while a button is held. A new target starts from the beginning.
+    fn pick_marquee(&mut self, focused: bool) {
+        let target = if self.press.is_some() || self.drag.is_some() {
+            None
+        } else {
+            self.hover.clone().or_else(|| if focused { self.cursor.clone() } else { None })
+        };
+        if self.marquee.as_ref().map(|m| &m.0) != target.as_ref() {
+            self.marquee = target.map(|k| (k, Instant::now()));
+        }
+    }
+
+    /// Where the popup for cut-off text on list row `tip.y` goes: the same
+    /// row, just outside the sidebar, opening towards the work area.
+    fn place_popup(&self, snap: &Snapshot, tip: &view::Tip, header_h: u16, list_h: u16) -> Option<tip::Popup> {
+        let row = (header_h + tip.y).checked_sub(self.scroll)?;
+        if row < header_h || row >= header_h + list_h {
+            return None;
+        }
+        let full = width(&tip.text) + 2;
+        let room = match snap.cfg.position {
+            Side::Left => snap.window_width.saturating_sub(snap.pane_left + snap.pane_width + 1),
+            Side::Right => snap.pane_left.saturating_sub(1),
+        } as usize;
+        if room < 6 {
+            return None;
+        }
+        let text = truncate(&tip.text, room.min(full) - 2);
+        let x = match snap.cfg.position {
+            Side::Left => snap.pane_left + snap.pane_width + 1,
+            Side::Right => (room - width(&text) - 2) as u16,
+        };
+        Some(tip::Popup { x, y: snap.pane_top + row, text, fg: self.pal.chip_fg, bg: self.pal.chip_bg })
+    }
+
+    /// Opens, moves or closes the popup to match `want`.
+    fn sync_popup(&mut self, want: Option<tip::Popup>) {
+        if self.popup.as_ref().map(|p| &p.1) == want.as_ref() {
+            return;
+        }
+        let bin = self.cfg().bin_path();
+        match (self.popup.take(), want) {
+            (Some((pane, _)), None) => tip::close(&pane),
+            (Some((pane, _)), Some(p)) if tip::update(&pane, &bin, &p).is_ok() => self.popup = Some((pane, p)),
+            (old, Some(p)) => {
+                if let Some((pane, _)) = old {
+                    tip::close(&pane);
+                }
+                if let Ok(id) = tip::open(&self.pane, &bin, &p) {
+                    self.popup = Some((id, p));
+                }
+            }
+            (None, None) => {}
+        }
+    }
+
     fn draw(&mut self) {
+        let focused = self.focused();
+        self.pick_marquee(focused);
         let Some(snap) = &self.snap else { return };
         let (w, h) = self.size;
         if w == 0 || h == 0 {
             return;
         }
         let rail = self.rail();
-        let focused = self.focused();
         let text = Strings::new(snap.cfg.lang);
         let ctx = Ctx {
             snap,
@@ -979,7 +1083,9 @@ impl App {
             hover: self.hover.as_ref(),
             hover_split: self.hover_split,
             drag: self.drag.as_ref(),
-            tip_for: self.hover.as_ref().filter(|_| self.press.is_none() && self.drag.is_none()),
+            marquee: if self.floating { None } else { self.marquee.as_ref().map(|(k, t)| (k, t.elapsed())) },
+            overflow: Cell::new(None),
+            tip_for: if self.floating { self.marquee.as_ref().map(|(k, _)| k) } else { None },
             tip: RefCell::new(None),
         };
         let list = view::list(&ctx);
@@ -1013,16 +1119,38 @@ impl App {
         if footer_h > 0 {
             view::footer(&mut screen, h - footer_h, &ctx, &footer);
         }
-        // The hovered node's cut-off text, whole, floating over the list.
-        if let Some(tip) = ctx.tip.borrow().as_ref() {
-            let y = (header_h + tip.y).checked_sub(self.scroll).filter(|y| (header_h..header_h + list_h).contains(y));
-            if let Some(y) = y {
-                view::tooltip(&mut screen, &ctx, tip.x.saturating_sub(1), y, &tip.text, header_h + list_h);
+        let rows = screen.encode_rows();
+        let changed: Vec<&String> =
+            rows.iter().enumerate().filter(|(i, r)| self.last_rows.get(*i) != Some(*r)).map(|(_, r)| r).collect();
+        if !changed.is_empty() {
+            let mut out = String::from("\x1b[?2026h");
+            out.extend(changed.into_iter().map(String::as_str));
+            out.push_str("\x1b[0m\x1b[?2026l");
+            let _ = term::write(&out);
+        }
+        self.last_rows = rows;
+
+        // Keep a cut-off name moving. A pointer resting on it keeps it
+        // going for at least one full pass, past the usual hover timeout.
+        let overflow = ctx.overflow.get();
+        let popup = ctx.tip.borrow().as_ref().and_then(|t| self.place_popup(snap, t, header_h, list_h));
+        self.anim_at = overflow.map(|_| Instant::now() + MARQUEE_FRAME);
+        let linger = match (overflow, &popup) {
+            (Some(dist), _) => Some(view::marquee_cycle(dist).max(HOVER_IDLE)),
+            (None, Some(_)) => Some(POPUP_IDLE),
+            (None, None) => None,
+        };
+        if let (Some(linger), Some(last)) = (linger, self.last_motion)
+            && !self.hover_edge
+            && self.hover.is_some()
+            && self.marquee.as_ref().map(|m| &m.0) == self.hover.as_ref()
+        {
+            let until = last + linger;
+            if self.hover_until.is_some_and(|h| h < until) {
+                self.hover_until = Some(until);
             }
         }
-        let mut out = String::new();
-        screen.encode(&mut out);
-        let _ = term::write(&out);
+        self.sync_popup(popup);
 
         let offset = header_h as i32 - self.scroll as i32;
         let groups =
