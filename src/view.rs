@@ -684,8 +684,8 @@ fn draw_rail_group(c: &mut Canvas<Hit>, y0: u16, ctx: &Ctx, g: &DirGroup, nodes:
     }
 }
 
-/// Session name and pane/dir count; on the right the TREE badge and, with
-/// `buttons`, the two split buttons; then a rule. Two rows.
+/// Session name and pane/dir count; on the right, with `buttons`, the two
+/// split buttons; then a rule. Two rows.
 pub fn header(c: &mut Canvas<Hit>, ctx: &Ctx, focused: bool, buttons: bool, text: &Strings) -> u16 {
     let p = ctx.pal;
     let full = c.w;
@@ -720,12 +720,6 @@ pub fn header(c: &mut Canvas<Hit>, ctx: &Ctx, focused: bool, buttons: bool, text
                 }
             }
             right = start.saturating_sub(1);
-        }
-        if focused {
-            let badge = " TREE ";
-            let bx = right.saturating_sub(width(badge) as u16);
-            c.put(bx, 0, badge, Style::default().bg(p.cursor_bg).fg(p.cursor_fg).with(BOLD), right);
-            right = bx.saturating_sub(1);
         }
         let x = put_text(c, 1, 0, name, ctx.plain().fg(p.accent).with(BOLD), right);
         let panes = ctx.snap.pane_count();
@@ -986,7 +980,7 @@ mod tests {
         let mut c = Canvas::new(28, 4, Style::default());
         let mut cx = ctx(&snap, &groups, &pal, &text, Variant::Indent, 28);
         assert_eq!(header(&mut c, &cx, true, true, &text), 2);
-        assert_eq!(c.row_text(0).trim_end(), " work          TREE   ◫  ⊟");
+        assert_eq!(c.row_text(0).trim_end(), " work  7 panes        ◫  ⊟");
         assert_eq!(c.hit(22, 0), Some(&Hit::Split('h')));
         assert_eq!(c.hit(25, 0), Some(&Hit::Split('v')));
         cx.hover_split = Some('h');
