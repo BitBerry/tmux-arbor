@@ -843,6 +843,11 @@ fn uninstall() -> Result<()> {
             let _ = tmux::run(["set-option", "-su", "-t", s, "@arbor-collapsed-dirs"]);
         }
     }
+    if let Ok(panes) = tmux::run(["list-panes", "-a", "-F", "#{pane_id}"]) {
+        for p in panes.lines().map(str::trim).filter(|p| !p.is_empty()) {
+            let _ = tmux::run(["set-option", "-pu", "-t", p, "@arbor-name"]);
+        }
+    }
     Ok(())
 }
 

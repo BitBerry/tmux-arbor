@@ -8,6 +8,11 @@ pub enum Key {
     Esc,
     Tab,
     Backspace,
+    Delete,
+    Home,
+    End,
+    F2,
+    Ctrl(char),
     Up,
     Down,
     Left,
@@ -101,6 +106,12 @@ fn step(b: &[u8]) -> Step {
         b'\r' | b'\n' => Step::Event(Event::Key(Key::Enter), 1),
         b'\t' => Step::Event(Event::Key(Key::Tab), 1),
         0x7f | 0x08 => Step::Event(Event::Key(Key::Backspace), 1),
+        0x01 => Step::Event(Event::Key(Key::Ctrl('a')), 1),
+        0x03 => Step::Event(Event::Key(Key::Ctrl('c')), 1),
+        0x05 => Step::Event(Event::Key(Key::Ctrl('e')), 1),
+        0x0b => Step::Event(Event::Key(Key::Ctrl('k')), 1),
+        0x15 => Step::Event(Event::Key(Key::Ctrl('u')), 1),
+        0x17 => Step::Event(Event::Key(Key::Ctrl('w')), 1),
         c if c < 0x20 => Step::Skip(1),
         _ => {
             let len = match first {
@@ -127,9 +138,14 @@ fn escape(b: &[u8]) -> Step {
         b'[' => csi(b),
         b'O' => {
             let Some(&c) = b.get(2) else { return Step::Incomplete };
-            match arrow(c) {
-                Some(k) => Step::Event(Event::Key(k), 3),
-                None => Step::Skip(3),
+            match c {
+                b'H' => Step::Event(Event::Key(Key::Home), 3),
+                b'F' => Step::Event(Event::Key(Key::End), 3),
+                b'Q' => Step::Event(Event::Key(Key::F2), 3),
+                _ => match arrow(c) {
+                    Some(k) => Step::Event(Event::Key(k), 3),
+                    None => Step::Skip(3),
+                },
             }
         }
         b']' | b'P' | b'_' => string(b),
@@ -164,6 +180,16 @@ fn csi(b: &[u8]) -> Step {
     match fin {
         b'I' if params.is_empty() => Step::Event(Event::FocusIn, n),
         b'O' if params.is_empty() => Step::Event(Event::FocusOut, n),
+        b'H' => Step::Event(Event::Key(Key::Home), n),
+        b'F' => Step::Event(Event::Key(Key::End), n),
+        b'Q' => Step::Event(Event::Key(Key::F2), n),
+        b'~' => match params {
+            b"3" => Step::Event(Event::Key(Key::Delete), n),
+            b"1" | b"7" => Step::Event(Event::Key(Key::Home), n),
+            b"4" | b"8" => Step::Event(Event::Key(Key::End), n),
+            b"12" => Step::Event(Event::Key(Key::F2), n),
+            _ => Step::Skip(n),
+        },
         c => match arrow(c) {
             Some(k) => Step::Event(Event::Key(k), n),
             None => Step::Skip(n),
@@ -252,6 +278,26 @@ mod tests {
             ]
         );
         assert_eq!(all("é".as_bytes()), vec![Event::Key(Key::Char('é'))]);
+        assert_eq!(
+            all("防火墙".as_bytes()),
+            vec![Event::Key(Key::Char('防')), Event::Key(Key::Char('火')), Event::Key(Key::Char('墙')),]
+        );
+        assert_eq!(
+            all(b"\x1b[3~\x1b[H\x1bOF\x1bOQ\x1b[12~\x01\x03\x05\x0b\x15\x17"),
+            vec![
+                Event::Key(Key::Delete),
+                Event::Key(Key::Home),
+                Event::Key(Key::End),
+                Event::Key(Key::F2),
+                Event::Key(Key::F2),
+                Event::Key(Key::Ctrl('a')),
+                Event::Key(Key::Ctrl('c')),
+                Event::Key(Key::Ctrl('e')),
+                Event::Key(Key::Ctrl('k')),
+                Event::Key(Key::Ctrl('u')),
+                Event::Key(Key::Ctrl('w')),
+            ]
+        );
     }
 
     #[test]

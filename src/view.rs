@@ -13,6 +13,8 @@ use crate::screen::{
 use crate::strings::Strings;
 use crate::theme::Palette;
 
+use crate::tmux::SEP;
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum Hit {
     #[default]
@@ -24,6 +26,10 @@ pub enum Hit {
         pid: String,
         dir: String,
     },
+    PaneRename {
+        wid: String,
+        pid: String,
+    },
     NewWindow,
     /// A split button: 'h' or 'v'.
     Split(char),
@@ -34,7 +40,7 @@ impl Hit {
     pub fn node(&self) -> Option<NodeKey> {
         match self {
             Hit::Dir(d) | Hit::DirAdd(d) => Some(NodeKey::Dir(d.clone())),
-            Hit::Pane { pid, .. } => Some(NodeKey::Pane(pid.clone())),
+            Hit::Pane { pid, .. } | Hit::PaneRename { pid, .. } => Some(NodeKey::Pane(pid.clone())),
             _ => None,
         }
     }
@@ -75,9 +81,15 @@ pub struct Ctx<'a> {
     pub hover: Option<&'a NodeKey>,
     /// The `+` button on a directory row currently under the pointer.
     pub hover_add: Option<&'a str>,
+    /// The `✎` rename button on a pane row currently under the pointer.
+    pub hover_rename: Option<&'a str>,
     /// The split button under the pointer.
     pub hover_split: Option<char>,
     pub drag: Option<&'a Drag>,
+    /// Active inline pane rename state, if editing.
+    pub rename: Option<&'a Rename>,
+    /// List-relative hardware cursor position `(x, y)` during inline rename.
+    pub edit_cursor: Cell<Option<(u16, u16)>>,
     /// The node whose cut-off text scrolls, and for how long it has.
     pub marquee: Option<(&'a NodeKey, Duration)>,
     /// Set while drawing: how many columns the marquee text overflows by.
@@ -87,6 +99,135 @@ pub struct Ctx<'a> {
     pub tip_for: Option<&'a NodeKey>,
     /// Set while drawing: where that cut-off text sits, and all of it.
     pub tip: RefCell<Option<Tip>>,
+}
+
+/// Inline editor state for renaming a pane (`@arbor-name`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Rename {
+    pub pid: String,
+    pub buf: String,
+    pub cursor: usize,
+    pub select_all: bool,
+}
+
+impl Rename {
+    pub fn new(pid: String, initial: String) -> Self {
+        let cursor = initial.len();
+        let select_all = !initial.is_empty();
+        Rename { pid, buf: initial, cursor, select_all }
+    }
+
+    pub fn insert(&mut self, ch: char) {
+        if ch.is_control() || ch == SEP {
+            return;
+        }
+        if self.select_all {
+            self.buf.clear();
+            self.cursor = 0;
+            self.select_all = false;
+        }
+        self.buf.insert(self.cursor, ch);
+        self.cursor += ch.len_utf8();
+    }
+
+    pub fn backspace(&mut self) {
+        if self.select_all {
+            self.clear();
+            return;
+        }
+        if self.cursor == 0 {
+            return;
+        }
+        if let Some((prev, _)) = self.buf[..self.cursor].char_indices().next_back() {
+            self.buf.drain(prev..self.cursor);
+            self.cursor = prev;
+        }
+    }
+
+    pub fn delete(&mut self) {
+        if self.select_all {
+            self.clear();
+            return;
+        }
+        if self.cursor >= self.buf.len() {
+            return;
+        }
+        if let Some(ch) = self.buf[self.cursor..].chars().next() {
+            self.buf.drain(self.cursor..self.cursor + ch.len_utf8());
+        }
+    }
+
+    pub fn move_left(&mut self) {
+        self.select_all = false;
+        if let Some((prev, _)) = self.buf[..self.cursor].char_indices().next_back() {
+            self.cursor = prev;
+        }
+    }
+
+    pub fn move_right(&mut self) {
+        self.select_all = false;
+        if let Some(ch) = self.buf[self.cursor..].chars().next() {
+            self.cursor += ch.len_utf8();
+        }
+    }
+
+    pub fn home(&mut self) {
+        self.select_all = false;
+        self.cursor = 0;
+    }
+
+    pub fn end(&mut self) {
+        self.select_all = false;
+        self.cursor = self.buf.len();
+    }
+
+    pub fn clear(&mut self) {
+        self.buf.clear();
+        self.cursor = 0;
+        self.select_all = false;
+    }
+
+    pub fn kill_to_end(&mut self) {
+        self.select_all = false;
+        self.buf.truncate(self.cursor);
+    }
+
+    pub fn delete_word(&mut self) {
+        if self.select_all {
+            self.clear();
+            return;
+        }
+        let head = &self.buf[..self.cursor];
+        let trimmed = head.trim_end();
+        let cut = trimmed
+            .rfind(char::is_whitespace)
+            .map(|i| i + trimmed[i..].chars().next().map_or(0, char::len_utf8))
+            .unwrap_or(0);
+        self.buf.drain(cut..self.cursor);
+        self.cursor = cut;
+    }
+
+    pub fn sanitized(&self) -> String {
+        self.buf.chars().filter(|&c| c != '\r' && c != '\n' && c != SEP).collect::<String>().trim().to_string()
+    }
+
+    /// Returns `(pad_spaces, visible_slice, cursor_col_offset)` scrolled to keep `cursor` inside `avail`.
+    pub fn visible_window(&self, avail: usize) -> (usize, &str, usize) {
+        if avail == 0 {
+            return (0, "", 0);
+        }
+        let prefix_cols = width(&self.buf[..self.cursor]);
+        let total_cols = width(&self.buf);
+        if total_cols < avail {
+            return (0, &self.buf, prefix_cols);
+        }
+        let scroll_cols = prefix_cols.saturating_sub(avail.saturating_sub(1));
+        let (pad, rest) = skip_width(&self.buf, scroll_cols);
+        let rest_offset = self.buf.len() - rest.len();
+        let caret_col = pad + width(&self.buf[rest_offset..self.cursor]);
+        let slice = take_width(rest, avail.saturating_sub(pad));
+        (pad, slice, caret_col)
+    }
 }
 
 /// Cut-off text the popup shows, in list coordinates.
@@ -158,7 +299,8 @@ impl Ctx<'_> {
     fn pane_look(&self, it: &PaneItem) -> Look {
         let p = self.pal;
         let key = NodeKey::Pane(it.pane.id.clone());
-        let mut look = Look { base: self.plain().fg(p.text), sub: p.muted, plain: !self.label_styles };
+        let plain = !self.label_styles || it.pane.custom_name.is_some();
+        let mut look = Look { base: self.plain().fg(p.text), sub: p.muted, plain };
         if it.is_focused() {
             look.base = Style::default().bg(p.cur_win_bg).fg(p.cur_win_fg).with(BOLD);
             look.sub = p.cur_win_sub;
@@ -316,12 +458,34 @@ fn put_pane_label(
     let avail = limit.saturating_sub(x) as usize;
     let total: usize = spans.iter().map(|(s, _)| width(s)).sum();
     let key = NodeKey::Pane(it.pane.id.clone());
-    let always_tip = has_sub || it.win_pane_count > 1;
-    ctx.note_tip(&key, y, || it.tooltip(ctx.home), total, avail, always_tip);
+    if ctx.hover_rename == Some(it.pane.id.as_str()) {
+        ctx.note_tip(&key, y, || ctx.text.rename_tip(), total, avail, true);
+    } else {
+        let always_tip = has_sub || it.win_pane_count > 1 || it.pane.custom_name.is_some();
+        ctx.note_tip(&key, y, || it.tooltip(ctx.home), total, avail, always_tip);
+    }
     if let Some(skip) = ctx.scroll(&key, total, avail) {
         return put_scrolled(c, x, y, &spans, skip, limit);
     }
     put_spans_truncated(c, x, y, &spans, limit, look.base)
+}
+
+fn draw_rename_field(c: &mut Canvas<Hit>, ctx: &Ctx, r: &Rename, x_start: u16, y: u16, x_end: u16) {
+    let avail = x_end.saturating_sub(x_start) as usize;
+    let st = if r.select_all {
+        Style::default().bg(ctx.pal.cursor_bg).fg(ctx.pal.cursor_fg)
+    } else {
+        Style::default().bg(ctx.pal.cur_pane_bg).fg(ctx.pal.cur_pane_fg).underline(UNDERLINE).us(ctx.pal.cursor_bg)
+    };
+    c.fill(x_start, x_end, y, st);
+    let (pad, slice, caret_col) = r.visible_window(avail);
+    let mut x = x_start;
+    if pad > 0 {
+        x = c.put(x, y, &" ".repeat(pad), st, x_end);
+    }
+    c.put(x, y, slice, st, x_end);
+    let caret_x = (x_start + caret_col as u16).min(x_end.saturating_sub(1));
+    ctx.edit_cursor.set(Some((caret_x, y)));
 }
 
 fn dir_badges(g: &DirGroup) -> String {
@@ -510,14 +674,35 @@ fn draw_pane_row(
         }
     }
 
-    let badge = it.badge();
-    let bw = width(&badge) as u16;
-    let mut text_limit = end;
-    if end > 6 + bw {
-        let bx = end - bw - 1;
-        c.put(bx, y, &badge, look.base.fg(look.sub), end);
-        text_limit = bx.saturating_sub(1);
+    if let Some(r) = ctx.rename.filter(|r| r.pid == it.pane.id) {
+        draw_rename_field(c, ctx, r, 4, y, end);
+        c.set_hit(0, full, y, &Hit::Pane { wid: it.wid.clone(), pid: it.pane.id.clone(), dir: g.raw_path.clone() });
+        nodes.push((NodeKey::Pane(it.pane.id.clone()), y, y));
+        return;
     }
+
+    let pkey = NodeKey::Pane(it.pane.id.clone());
+    let hovered = ctx.rename.is_none() && ctx.is_hover(&pkey) && end > 8;
+    let mut text_limit = if hovered {
+        let rx = end - 3;
+        let rst = if ctx.hover_rename == Some(it.pane.id.as_str()) {
+            Style::default().bg(ctx.pal.cursor_bg).fg(ctx.pal.cursor_fg).with(BOLD)
+        } else {
+            Style::default().bg(ctx.pal.cur_win_bg).fg(ctx.pal.cur_win_fg).with(BOLD)
+        };
+        c.put(rx, y, " ✎ ", rst, end);
+        rx.saturating_sub(1)
+    } else {
+        let badge = it.badge();
+        let bw = width(&badge) as u16;
+        if end > 6 + bw {
+            let bx = end - bw - 1;
+            c.put(bx, y, &badge, look.base.fg(look.sub), end);
+            bx.saturating_sub(1)
+        } else {
+            end
+        }
+    };
 
     let sub = (ctx.snap.cfg.group_by == GroupBy::Git).then(|| it.rel_subdir(&g.raw_path, ctx.home)).flatten();
     let mut has_sub = false;
@@ -534,7 +719,10 @@ fn draw_pane_row(
 
     put_pane_label(c, ctx, it, (4, y, text_limit), &look, has_sub);
     c.set_hit(0, full, y, &Hit::Pane { wid: it.wid.clone(), pid: it.pane.id.clone(), dir: g.raw_path.clone() });
-    nodes.push((NodeKey::Pane(it.pane.id.clone()), y, y));
+    if hovered {
+        c.set_hit(end - 3, full, y, &Hit::PaneRename { wid: it.wid.clone(), pid: it.pane.id.clone() });
+    }
+    nodes.push((pkey, y, y));
 }
 
 fn draw_line_group(c: &mut Canvas<Hit>, y0: u16, ctx: &Ctx, g: &DirGroup, nodes: &mut Vec<(NodeKey, u16, u16)>) {
@@ -644,16 +832,39 @@ fn draw_dir_block(c: &mut Canvas<Hit>, y0: u16, ctx: &Ctx, g: &DirGroup, nodes: 
         };
         c.put(x0 + 2, y, ind, look.base.fg(dot_color), x1);
 
-        let badge = it.badge();
-        let bw = width(&badge) as u16;
-        let mut text_limit = x1.saturating_sub(1);
-        if x1 > x0 + 6 + bw {
-            let bx = x1 - bw - 1;
-            c.put(bx, y, &badge, look.base.fg(look.sub), x1);
-            text_limit = bx.saturating_sub(1);
+        if let Some(r) = ctx.rename.filter(|r| r.pid == it.pane.id) {
+            draw_rename_field(c, ctx, r, x0 + 4, y, x1);
+            c.set_hit(0, full, y, &Hit::Pane { wid: it.wid.clone(), pid: it.pane.id.clone(), dir: g.raw_path.clone() });
+            nodes.push((pkey, y, y));
+            continue;
         }
+
+        let hovered = ctx.rename.is_none() && ctx.is_hover(&pkey) && x1 > x0 + 8;
+        let text_limit = if hovered {
+            let rx = x1 - 3;
+            let rst = if ctx.hover_rename == Some(it.pane.id.as_str()) {
+                Style::default().bg(p.cursor_bg).fg(p.cursor_fg).with(BOLD)
+            } else {
+                Style::default().bg(p.cur_win_bg).fg(p.cur_win_fg).with(BOLD)
+            };
+            c.put(rx, y, " ✎ ", rst, x1);
+            rx.saturating_sub(1)
+        } else {
+            let badge = it.badge();
+            let bw = width(&badge) as u16;
+            if x1 > x0 + 6 + bw {
+                let bx = x1 - bw - 1;
+                c.put(bx, y, &badge, look.base.fg(look.sub), x1);
+                bx.saturating_sub(1)
+            } else {
+                x1.saturating_sub(1)
+            }
+        };
         put_pane_label(c, ctx, it, (x0 + 4, y, text_limit), &look, false);
         c.set_hit(0, full, y, &Hit::Pane { wid: it.wid.clone(), pid: it.pane.id.clone(), dir: g.raw_path.clone() });
+        if hovered {
+            c.set_hit(x1 - 3, x1, y, &Hit::PaneRename { wid: it.wid.clone(), pid: it.pane.id.clone() });
+        }
         nodes.push((pkey, y, y));
     }
 }
@@ -859,8 +1070,11 @@ mod tests {
             cursor: None,
             hover: None,
             hover_add: None,
+            hover_rename: None,
             hover_split: None,
             drag: None,
+            rename: None,
+            edit_cursor: Cell::new(None),
             marquee: None,
             overflow: Cell::new(None),
             tip_for: None,
@@ -1055,5 +1269,57 @@ mod tests {
         tooltip(&mut canvas, &c, 5, 1, "3:staging-db-migrations", 3);
         assert_eq!(canvas.row_text(1), " 3:staging-db-migra ");
         assert_eq!(canvas.row_text(2), " tions              ");
+    }
+
+    #[test]
+    fn rename_editor_handles_select_all_and_wide_chars() {
+        let mut r = Rename::new("%1".into(), "agy".into());
+        assert!(r.select_all);
+        r.insert('防');
+        assert!(!r.select_all);
+        assert_eq!(r.buf, "防");
+        r.insert('火');
+        r.insert('墙');
+        assert_eq!(r.buf, "防火墙");
+        r.move_left();
+        r.insert('!');
+        assert_eq!(r.buf, "防火!墙");
+        r.backspace();
+        assert_eq!(r.buf, "防火墙");
+        r.delete();
+        assert_eq!(r.buf, "防火");
+
+        let long = Rename::new("%1".into(), "防火墙排查任务".into());
+        let (pad, slice, caret) = long.visible_window(6);
+        assert!(caret < 6);
+        assert!(pad + width(slice) <= 6);
+
+        let mut r2 = Rename::new("%1".into(), "hello world".into());
+        r2.move_right();
+        r2.delete_word();
+        assert_eq!(r2.buf, "hello ");
+        r2.clear();
+        assert_eq!(r2.buf, "");
+    }
+
+    #[test]
+    fn pane_hover_shows_rename_button_and_inline_edit_sets_cursor() {
+        let snap = sample();
+        let groups = snap.groups_with_home(Some("/home/u"));
+        let pal = theme::light();
+        let text = Strings::new(crate::config::Lang::Zh);
+        let mut cx = ctx(&snap, &groups, &pal, &text, Variant::Indent, 28);
+        let hover = NodeKey::Pane("%1".into());
+        cx.hover = Some(&hover);
+        let lh = list(&cx);
+        assert_eq!(lh.canvas.row_text(1).trim_end(), "  ▪ nvim                 ✎");
+        assert_eq!(lh.canvas.hit(25, 1), Some(&Hit::PaneRename { wid: "@1".into(), pid: "%1".into() }));
+
+        cx.hover = None;
+        let ren = Rename::new("%1".into(), "排查".into());
+        cx.rename = Some(&ren);
+        let le = list(&cx);
+        assert_eq!(le.canvas.row_text(1).trim_end(), "  ▪ 排查");
+        assert_eq!(cx.edit_cursor.get(), Some((8, 1)));
     }
 }

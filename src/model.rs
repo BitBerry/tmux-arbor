@@ -25,8 +25,11 @@ pub struct PaneInfo {
     pub id: String,
     pub active: bool,
     pub last: bool,
-    /// Plain text shown for the pane: @arbor-pane-format, else the running command.
+    /// Display name: @arbor-name if set, else the automatic pane label.
     pub cmd: String,
+    /// Plain text of the automatic pane label (@arbor-pane-format or running command).
+    pub auto_cmd: String,
+    pub custom_name: Option<String>,
     pub label: Label,
     pub cwd: String,
     pub git_root: Option<String>,
@@ -114,17 +117,14 @@ impl PaneItem {
 
     pub fn tooltip(&self, home: Option<&str>) -> String {
         let disp = shorten_home(&self.pane.cwd, home);
+        let name = match &self.pane.custom_name {
+            Some(custom) if custom != &self.pane.auto_cmd => format!("{custom} ({})", self.pane.auto_cmd),
+            _ => self.pane.cmd.clone(),
+        };
         if self.win_pane_count > 1 {
-            format!(
-                "{} · w{} ({}/{}) · {}",
-                self.pane.cmd,
-                self.win_index,
-                self.pane_idx + 1,
-                self.win_pane_count,
-                disp
-            )
+            format!("{name} · w{} ({}/{}) · {disp}", self.win_index, self.pane_idx + 1, self.win_pane_count)
         } else {
-            format!("{} · w{} · {}", self.pane.cmd, self.win_index, disp)
+            format!("{name} · w{} · {disp}", self.win_index)
         }
     }
 }
@@ -344,6 +344,7 @@ impl Snapshot {
             "#{pane_last}",
             crate::tip::KIND,
             "#{pane_current_path}",
+            "#{@arbor-name}",
             PANE_LABEL,
         ]);
         let out = tmux::Batch::new()
@@ -423,16 +424,21 @@ impl Snapshot {
                     });
                 }
                 "P" => {
-                    let f: Vec<&str> = rest.splitn(7, SEP).collect();
-                    if f.len() < 7 {
+                    let f: Vec<&str> = rest.splitn(8, SEP).collect();
+                    if f.len() < 8 {
                         continue;
                     }
-                    let label = Label::parse(f[6]);
+                    let custom_name = (!f[6].trim().is_empty()).then(|| f[6].trim().to_string());
+                    let label = Label::parse(f[7]);
+                    let auto_cmd = label.plain();
+                    let cmd = custom_name.clone().unwrap_or_else(|| auto_cmd.clone());
                     let info = PaneInfo {
                         id: f[1].into(),
                         active: on(f[2]),
                         last: on(f[3]),
-                        cmd: label.plain(),
+                        cmd,
+                        auto_cmd,
+                        custom_name,
                         label,
                         cwd: normalize_path(f[5]),
                         git_root: None,
@@ -500,6 +506,10 @@ impl Snapshot {
     /// The window holding a pane, and the pane's position among its work panes.
     pub fn find_pane(&self, id: &str) -> Option<(&Win, usize)> {
         self.windows.iter().find_map(|w| w.panes.iter().position(|p| p.id == id).map(|i| (w, i)))
+    }
+
+    pub fn pane_mut(&mut self, id: &str) -> Option<&mut PaneInfo> {
+        self.windows.iter_mut().find_map(|w| w.panes.iter_mut().find(|p| p.id == id))
     }
 
     pub fn pane_count(&self) -> usize {
@@ -650,17 +660,17 @@ pub mod tests {
         out += &format!("W{s}@2{s}2{s}0{s}#{s}server\n");
         out += &format!("W{s}@3{s}3{s}0{s}-{s}git\n");
         out += &format!("W{s}@4{s}4{s}0{s}!{s}db\n");
-        for (w, p, active, last, sb, cwd, cmd) in [
-            ("@1", "%0", 0, 0, "1", "/home/u/ws/tmux-arbor", "arbor"),
-            ("@1", "%1", 1, 0, "", "/home/u/ws/tmux-arbor", "nvim"),
-            ("@1", "%2", 0, 1, "", "/home/u/ws/tmux-arbor/src", "zsh"),
-            ("@1", "%3", 0, 0, "", "/home/u/ws/tmux-arbor", "cargo"),
-            ("@2", "%4", 1, 0, "", "/home/u/ws/api-server", "npm"),
-            ("@2", "%5", 0, 0, "", "/home/u/ws/api-server", "tail"),
-            ("@3", "%6", 1, 0, "", "/home/u/ws/tmux-arbor", "lazygit"),
-            ("@4", "%7", 1, 0, "", "/home/u", "psql"),
+        for (w, p, active, last, sb, cwd, custom, cmd) in [
+            ("@1", "%0", 0, 0, "1", "/home/u/ws/tmux-arbor", "", "arbor"),
+            ("@1", "%1", 1, 0, "", "/home/u/ws/tmux-arbor", "", "nvim"),
+            ("@1", "%2", 0, 1, "", "/home/u/ws/tmux-arbor/src", "", "zsh"),
+            ("@1", "%3", 0, 0, "", "/home/u/ws/tmux-arbor", "", "cargo"),
+            ("@2", "%4", 1, 0, "", "/home/u/ws/api-server", "", "npm"),
+            ("@2", "%5", 0, 0, "", "/home/u/ws/api-server", "", "tail"),
+            ("@3", "%6", 1, 0, "", "/home/u/ws/tmux-arbor", "", "lazygit"),
+            ("@4", "%7", 1, 0, "", "/home/u", "", "psql"),
         ] {
-            out += &format!("P{s}{w}{s}{p}{s}{active}{s}{last}{s}{sb}{s}{cwd}{s}{cmd}\n");
+            out += &format!("P{s}{w}{s}{p}{s}{active}{s}{last}{s}{sb}{s}{cwd}{s}{custom}{s}{cmd}\n");
         }
         Snapshot::parse(&out).unwrap()
     }
@@ -759,5 +769,22 @@ pub mod tests {
         assert_eq!(nodes[0], NodeKey::Dir("/home/u/ws/tmux-arbor".into()));
         assert_eq!(nodes[1], NodeKey::Dir("/home/u/ws/tmux-arbor/src".into()));
         assert_eq!(snap.nodes(true).len(), 7);
+    }
+
+    #[test]
+    fn custom_pane_name_overrides_cmd_and_keeps_auto_in_tooltip() {
+        let s = SEP;
+        let mut out = String::new();
+        out += &format!("S{s}$1{s}work{s}@1{s}0{s}1{s}1{s}28{s}120{s}1{s}0{s}1{s}1{s}0{s}0{s}0{s}0{s}\n");
+        out += &format!("O{s}\n");
+        out += &format!("W{s}@1{s}1{s}1{s}*{s}agy\n");
+        out += &format!("P{s}@1{s}%1{s}1{s}0{s}{s}/home/u/ws/xray-manager{s}防火墙排查{s}agy\n");
+        let snap = Snapshot::parse(&out).unwrap();
+        let groups = snap.groups_with_home(Some("/home/u"));
+        let item = &groups[0].items[0];
+        assert_eq!(item.pane.cmd, "防火墙排查");
+        assert_eq!(item.pane.auto_cmd, "agy");
+        assert_eq!(item.pane.custom_name.as_deref(), Some("防火墙排查"));
+        assert_eq!(item.tooltip(Some("/home/u")), "防火墙排查 (agy) · w1 · ~/ws/xray-manager");
     }
 }

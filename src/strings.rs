@@ -26,19 +26,40 @@ impl Strings {
 
     pub fn hints_focused(&self) -> Vec<String> {
         let list: &[&str] = if self.zh {
-            &["j k 移动", "h l 折叠", "⏎ 切换", "c 新建", "J K 排序", "< > 宽度", "q 退出"]
+            &["j k 移动", "h l 折叠", "⏎ 切换", "R 重命名", "c 新建", "J K 排序", "< > 宽度", "q 退出"]
         } else {
-            &["j k move", "h l fold", "⏎ open", "c new", "J K reorder", "< > width", "q leave"]
+            &["j k move", "h l fold", "⏎ open", "R rename", "c new", "J K reorder", "< > width", "q leave"]
         };
         list.iter().map(|s| s.to_string()).collect()
     }
 
     pub fn hints_idle(&self, prefix: &str) -> Vec<String> {
         if self.zh {
-            vec![format!("{prefix} T 键盘操作"), "拖动目录或 pane 可重排/合屏".into()]
+            vec![format!("{prefix} T 键盘操作"), "拖动目录/pane 重排 · 双击或 ✎ 重命名".into()]
         } else {
-            vec![format!("{prefix} T keyboard"), "drag dir or pane to reorder".into()]
+            vec![format!("{prefix} T keyboard"), "drag to reorder · dblclick/✎ rename".into()]
         }
+    }
+
+    pub fn hints_rename(&self) -> Vec<String> {
+        let list: &[&str] = if self.zh {
+            &["⏎ 保存", "Esc 取消", "留空恢复默认"]
+        } else {
+            &["⏎ save", "Esc cancel", "empty resets"]
+        };
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    pub fn rename_tip(&self) -> String {
+        self.pick("重命名 (双击或按 R)", "rename (dblclick or R)")
+    }
+
+    pub fn renamed_to(&self, name: &str) -> String {
+        if self.zh { format!("已重命名为 {name}") } else { format!("renamed to {name}") }
+    }
+
+    pub fn name_reset(&self) -> String {
+        self.pick("已恢复默认名称", "name reset")
     }
 
     pub fn before(&self, x: &str) -> String {

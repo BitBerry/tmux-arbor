@@ -23,7 +23,7 @@ use crate::term;
 use crate::theme::{self, Palette};
 use crate::tip;
 use crate::tmux::{self, Batch};
-use crate::view::{self, Ctx, Drag, Footer, Group, Hit, Target};
+use crate::view::{self, Ctx, Drag, Footer, Group, Hit, Rename, Target};
 
 /// How long a burst of SIGWINCH must settle before a resize is judged.
 const RESIZE_SETTLE: Duration = Duration::from_millis(150);
@@ -112,6 +112,7 @@ struct App {
     cursor: Option<NodeKey>,
     hover: Option<NodeKey>,
     hover_add: Option<String>,
+    hover_rename: Option<String>,
     hover_split: Option<char>,
     hover_until: Option<Instant>,
     last_motion: Option<Instant>,
@@ -132,6 +133,10 @@ struct App {
     scroll: u16,
     press: Option<Press>,
     drag: Option<Drag>,
+    /// Inline pane rename: `(editor, return_focus_on_end, started_at)`.
+    rename: Option<(Rename, bool, Instant)>,
+    last_click: Option<(String, Instant)>,
+    cursor_shown: bool,
     frame: Option<Frame>,
     msg: Option<(String, Instant)>,
     was_focused: bool,
@@ -181,6 +186,7 @@ impl App {
             cursor: None,
             hover: None,
             hover_add: None,
+            hover_rename: None,
             hover_split: None,
             hover_until: None,
             last_motion: None,
@@ -194,6 +200,9 @@ impl App {
             scroll: 0,
             press: None,
             drag: None,
+            rename: None,
+            last_click: None,
+            cursor_shown: false,
             frame: None,
             msg: None,
             was_focused: false,
@@ -303,6 +312,7 @@ impl App {
             self.hover_until = None;
             self.hover = None;
             self.hover_add = None;
+            self.hover_rename = None;
             self.hover_split = None;
             self.draw();
         }
@@ -433,6 +443,12 @@ impl App {
             self.last_current = current;
             self.hover = None;
             self.hover_add = None;
+            self.hover_rename = None;
+        }
+        if let Some((r, ..)) = &self.rename
+            && (rail || snap.find_pane(&r.pid).is_none())
+        {
+            self.rename = None;
         }
         if let Some(c) = &self.cursor
             && !nodes.contains(c)
@@ -542,13 +558,23 @@ impl App {
         match ev {
             Event::Key(k) => {
                 self.key_focus = true;
-                self.key(k);
+                if self.rename.is_some() {
+                    self.rename_key(k);
+                } else {
+                    self.key(k);
+                }
             }
             Event::Mouse(m) => self.mouse(m),
             Event::FocusIn | Event::FocusOut => {
                 if ev == Event::FocusOut {
                     self.hover = None;
                     self.hover_add = None;
+                    self.hover_rename = None;
+                    if let Some((_, _, started_at)) = self.rename
+                        && started_at.elapsed() > Duration::from_millis(150)
+                    {
+                        self.finish_rename(false);
+                    }
                 }
                 self.refresh_at.get_or_insert(Instant::now());
             }
@@ -558,6 +584,89 @@ impl App {
                 self.draw();
             }
         }
+    }
+
+    fn start_rename(&mut self, pid: &str, return_focus: bool) {
+        if self.rail() {
+            return;
+        }
+        let Some(initial) = self.snap.as_ref().and_then(|s| s.find_pane(pid)).map(|(w, i)| w.panes[i].cmd.clone())
+        else {
+            return;
+        };
+        if return_focus {
+            let _ = tmux::run(["select-pane", "-t", &self.pane]);
+        }
+        self.rename = Some((Rename::new(pid.to_string(), initial), return_focus, Instant::now()));
+        self.cursor = Some(NodeKey::Pane(pid.to_string()));
+        self.reveal = self.cursor.clone();
+        self.hover = None;
+        self.hover_add = None;
+        self.hover_rename = None;
+        self.hover_split = None;
+        self.drag = None;
+        self.press = None;
+        self.draw();
+    }
+
+    fn finish_rename(&mut self, commit: bool) {
+        let Some((r, return_focus, _)) = self.rename.take() else { return };
+        if commit {
+            let val = r.sanitized();
+            let res = if val.is_empty() {
+                tmux::run(["set-option", "-pu", "-t", &r.pid, "@arbor-name"])
+            } else {
+                tmux::run(["set-option", "-p", "-t", &r.pid, "@arbor-name", &val])
+            };
+            if res.is_ok() {
+                if let Some(p) = self.snap.as_mut().and_then(|s| s.pane_mut(&r.pid)) {
+                    if val.is_empty() {
+                        p.custom_name = None;
+                        p.cmd = p.auto_cmd.clone();
+                    } else {
+                        p.custom_name = Some(val.clone());
+                        p.cmd = val.clone();
+                    }
+                }
+                let text = self.strings();
+                self.say(if val.is_empty() { text.name_reset() } else { text.renamed_to(&val) });
+                let _ = cli::notify(libc::SIGUSR1);
+            }
+        }
+        if return_focus {
+            self.leave();
+        }
+        self.draw();
+    }
+
+    fn rename_key(&mut self, k: Key) {
+        match k {
+            Key::Enter => {
+                self.finish_rename(true);
+                return;
+            }
+            Key::Esc | Key::Ctrl('c') => {
+                self.finish_rename(false);
+                return;
+            }
+            _ => {}
+        }
+        if let Some((r, ..)) = &mut self.rename {
+            match k {
+                Key::Char(ch) => r.insert(ch),
+                Key::Backspace => r.backspace(),
+                Key::Delete => r.delete(),
+                Key::Left => r.move_left(),
+                Key::Right => r.move_right(),
+                Key::Home | Key::Ctrl('a') => r.home(),
+                Key::End | Key::Ctrl('e') => r.end(),
+                Key::Ctrl('u') => r.clear(),
+                Key::Ctrl('k') => r.kill_to_end(),
+                Key::Ctrl('w') => r.delete_word(),
+                _ => return,
+            }
+        }
+        self.draw();
     }
 
     fn key(&mut self, k: Key) {
@@ -626,6 +735,12 @@ impl App {
                     self.cursor = Some(NodeKey::Pane(pid.clone()));
                     self.goto_pane(&w.id.clone(), pid);
                 }
+            }
+            Key::Char('R') | Key::F2 => {
+                if let NodeKey::Pane(pid) = &node {
+                    self.start_rename(pid, false);
+                }
+                return;
             }
             Key::Char('J') => self.shift(&node, &groups, 1),
             Key::Char('K') => self.shift(&node, &groups, -1),
@@ -816,6 +931,15 @@ impl App {
 
     fn mouse(&mut self, m: Mouse) {
         let hit = self.hit_at(m.x, m.y);
+        if let Some((r, ..)) = &self.rename {
+            if m.kind == MouseKind::Press(0) {
+                let on_editing = matches!(&hit, Hit::Pane { pid, .. } | Hit::PaneRename { pid, .. } if pid == &r.pid);
+                if !on_editing {
+                    self.finish_rename(false);
+                }
+            }
+            return;
+        }
         match m.kind {
             MouseKind::Press(0) => {
                 self.press = Some(Press { x: m.x, y: m.y, hit });
@@ -862,6 +986,10 @@ impl App {
                     Hit::DirAdd(d) => Some(d.clone()),
                     _ => None,
                 };
+                let hover_rename = match &hit {
+                    Hit::PaneRename { pid, .. } => Some(pid.clone()),
+                    _ => None,
+                };
                 let hover_split = match hit {
                     Hit::Split(d) => Some(d),
                     _ => None,
@@ -874,9 +1002,14 @@ impl App {
                 self.hover_until = Some(now + if edge { HOVER_EDGE } else { HOVER_IDLE });
                 self.last_motion = Some(now);
                 self.hover_edge = edge;
-                if hover != self.hover || hover_add != self.hover_add || hover_split != self.hover_split {
+                if hover != self.hover
+                    || hover_add != self.hover_add
+                    || hover_rename != self.hover_rename
+                    || hover_split != self.hover_split
+                {
                     self.hover = hover;
                     self.hover_add = hover_add;
+                    self.hover_rename = hover_rename;
                     self.hover_split = hover_split;
                     self.draw();
                 }
@@ -890,6 +1023,7 @@ impl App {
                 };
                 self.hover = None;
                 self.hover_add = None;
+                self.hover_rename = None;
                 self.hover_split = None;
                 self.draw();
             }
@@ -909,9 +1043,18 @@ impl App {
                 }
                 self.draw();
             }
+            Hit::PaneRename { pid, .. } => self.start_rename(pid, !self.was_focused),
             Hit::Pane { wid, pid, .. } => {
-                self.cursor = Some(NodeKey::Pane(pid.clone()));
-                self.goto_pane(&wid.clone(), &pid.clone());
+                let dbl =
+                    self.last_click.as_ref().is_some_and(|(p, t)| p == pid && t.elapsed() < Duration::from_millis(400));
+                if dbl && !self.rail() && self.snap.as_ref().is_some_and(|s| s.window_id == *wid) {
+                    self.last_click = None;
+                    self.start_rename(pid, !self.was_focused);
+                } else {
+                    self.last_click = Some((pid.clone(), Instant::now()));
+                    self.cursor = Some(NodeKey::Pane(pid.clone()));
+                    self.goto_pane(&wid.clone(), &pid.clone());
+                }
             }
             Hit::Split(dir) => self.split(*dir),
             _ => {}
@@ -1004,6 +1147,11 @@ impl App {
     // ---- drawing ---------------------------------------------------------
 
     fn footer(&self, ctx: &Ctx, text: &Strings, focused: bool) -> Footer {
+        if self.rename.is_some() {
+            let mut lines = wrap(&text.hints_rename(), ctx.width.saturating_sub(2) as usize);
+            lines.truncate(3);
+            return Footer { lines, accent: true, ..Footer::default() };
+        }
         if let Some(d) = &self.drag {
             let hint = match &d.target {
                 Some(Target::Invalid) => (text.dir_cwd_hint(), false),
@@ -1118,6 +1266,7 @@ impl App {
             return;
         }
         let rail = self.rail();
+        let editing = self.rename.is_some();
         let text = Strings::new(snap.cfg.lang);
         let groups = snap.groups();
         let ctx = Ctx {
@@ -1130,14 +1279,17 @@ impl App {
             rail,
             variant: snap.cfg.style,
             label_styles: snap.cfg.label_styles,
-            cursor: if focused { self.cursor.as_ref() } else { None },
-            hover: self.hover.as_ref(),
-            hover_add: self.hover_add.as_deref(),
-            hover_split: self.hover_split,
-            drag: self.drag.as_ref(),
-            marquee: if self.floating { None } else { self.marquee.as_ref().map(|(k, t)| (k, t.elapsed())) },
+            cursor: if focused && !editing { self.cursor.as_ref() } else { None },
+            hover: if editing { None } else { self.hover.as_ref() },
+            hover_add: if editing { None } else { self.hover_add.as_deref() },
+            hover_rename: if editing { None } else { self.hover_rename.as_deref() },
+            hover_split: if editing { None } else { self.hover_split },
+            drag: if editing { None } else { self.drag.as_ref() },
+            rename: self.rename.as_ref().map(|(r, ..)| r),
+            edit_cursor: Cell::new(None),
+            marquee: if self.floating || editing { None } else { self.marquee.as_ref().map(|(k, t)| (k, t.elapsed())) },
             overflow: Cell::new(None),
-            tip_for: if self.floating { self.marquee.as_ref().map(|(k, _)| k) } else { None },
+            tip_for: if self.floating && !editing { self.marquee.as_ref().map(|(k, _)| k) } else { None },
             tip: RefCell::new(None),
         };
         let list = view::list(&ctx);
@@ -1174,10 +1326,25 @@ impl App {
         let rows = screen.encode_rows();
         let changed: Vec<&String> =
             rows.iter().enumerate().filter(|(i, r)| self.last_rows.get(*i) != Some(*r)).map(|(_, r)| r).collect();
+        let edit_pos = ctx.edit_cursor.get().and_then(|(ex, ey)| {
+            let sy = (header_h + ey).checked_sub(self.scroll)?;
+            (sy >= header_h && sy < header_h + list_h && ex < w).then_some((ex, sy))
+        });
+        let mut out = String::new();
         if !changed.is_empty() {
-            let mut out = String::from("\x1b[?2026h");
+            out.push_str("\x1b[?2026h");
             out.extend(changed.into_iter().map(String::as_str));
             out.push_str("\x1b[0m\x1b[?2026l");
+        }
+        if let Some((cx, cy)) = edit_pos {
+            use std::fmt::Write;
+            let _ = write!(out, "\x1b[{};{}H\x1b[?25h", cy + 1, cx + 1);
+            self.cursor_shown = true;
+        } else if self.cursor_shown {
+            out.push_str("\x1b[?25l");
+            self.cursor_shown = false;
+        }
+        if !out.is_empty() {
             let _ = term::write(&out);
         }
         self.last_rows = rows;
