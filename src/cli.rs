@@ -645,6 +645,9 @@ fn init() -> Result<()> {
         ("@arbor-style", "branches"),
         ("@arbor-hide-status-windows", "on"),
         ("@arbor-status-button", "on"),
+        ("@arbor-group-by", "cwd"),
+        ("@arbor-dir-display", "smart"),
+        ("@arbor-dir-sort", "window"),
     ] {
         if get(k).is_empty() {
             b.cmd(["set-option", "-g", k, v]);
@@ -832,8 +835,13 @@ fn uninstall() -> Result<()> {
     if tmux::run(["list-keys", "-T", "root", "DoubleClick1Border"]).unwrap_or_default().contains("arbor") {
         let _ = tmux::run(["unbind-key", "-T", "root", "DoubleClick1Border"]);
     }
-    for k in ["@arbor-bin", "@arbor-orig-rename-format", "@arbor-orig-status-click"] {
+    for k in ["@arbor-bin", "@arbor-orig-rename-format", "@arbor-orig-status-click", "@arbor-collapsed-dirs"] {
         let _ = tmux::run(["set-option", "-gu", k]);
+    }
+    if let Ok(sessions) = tmux::run(["list-sessions", "-F", "#{session_id}"]) {
+        for s in sessions.lines().map(str::trim).filter(|s| !s.is_empty()) {
+            let _ = tmux::run(["set-option", "-su", "-t", s, "@arbor-collapsed-dirs"]);
+        }
     }
     Ok(())
 }

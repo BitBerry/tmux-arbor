@@ -58,11 +58,6 @@ impl Style {
         self
     }
 
-    pub fn without(mut self, a: u16) -> Self {
-        self.attrs &= !a;
-        self
-    }
-
     /// Sets one underline kind, replacing any other.
     pub fn underline(mut self, kind: u16) -> Self {
         self.attrs = (self.attrs & !UNDER_ANY) | kind;

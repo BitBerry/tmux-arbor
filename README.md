@@ -45,12 +45,13 @@ run-shell ~/.tmux/plugins/tmux-arbor/arbor.tmux
 
 ## 树
 
+采用**目录 → pane** 两层扁平结构，直接按每个 pane 所在的工作目录归组：
+
 | 节点 | 内容 |
 | --- | --- |
-| 根 · 当前 session | 标题行显示 session 名和 window 数。用 prefix `(` `)` 切换 session 时整棵树替换。 |
-| 树枝 · window | 文字完全由 tmux 决定：当前 window 用 `window-status-current-format`，其他用 `window-status-format`，格式里的 `#[fg=…]` 样式照样着色。想让树和状态栏不一样，设置 `@arbor-window-format`。 |
-| 叶 · pane | pane 序号 + 正在运行的命令（`pane_current_command`），可用 `@arbor-pane-format` 换成别的格式。有多个 pane 的 window 行首是折叠箭头 `▸`（折叠）/ `▾`（展开），pane 用 `├─` 连线挂在箭头下面；只有一个 pane 的 window 不展开，行首是一个小圆点 `∙`。 |
-| 状态标记 | 来自格式里的 `#F`（`*` 当前、`-` 上一个、`#` activity、`!` bell、`Z` 缩放），不另画图标。 |
+| 根 · 当前 session | 标题行显示 session 名与 pane / 目录数。用 prefix `(` `)` 切换 session 时整棵树替换。 |
+| 枝 · 工作目录 | 默认仅展示末尾目录名（如 `tmux-arbor/`），存在同名目录时自动向上补足最短可区分父路径（`ws/app/` vs `work/app/`）；可通过 `@arbor-group-by git` 归并到 Git 根目录。折叠后若包含当前焦点 pane 或带 `#`/`!` 通知，目录行保留高亮与角标。 |
+| 叶 · pane | 显示正在运行的命令（`pane_current_command`，可用 `@arbor-pane-format` 换成别的格式），右侧显示所属 window 编号与状态标记（`*` 当前焦点、`#` activity、`!` bell）；与焦点同在一个 window 的兄弟分屏用浅钢蓝底色标出。 |
 
 侧边栏打开时，状态栏的 `status-format[0]` 换成只含 status-left / status-right 的版本（横排 window 列表交给树），并在最左边加一个 `≡` 按钮；隐藏时恢复原来的状态栏。
 
@@ -58,11 +59,11 @@ run-shell ~/.tmux/plugins/tmux-arbor/arbor.tmux
 
 三种画法（`@arbor-style`）：
 
-- `branches` 树枝：一行一个节点，pane 用 `├─` 连线挂在 window 下面，最紧凑。
-- `blocks` 线框：每个 window 一个细线框，标题嵌在上边框里。
-- `map` 版图：pane 按真实分屏画成格子，最小的 pane 占一行、整张图最多 6 行；侧边栏窄于 24 列时自动退化成 branches。
+- `branches` / `indent` 简洁缩进：目录行下平铺缩进的 pane 行，最紧凑。
+- `tree` 完整树线：用 `├─` / `└─` 连线把目录和 pane 串起来。
+- `blocks` 线框：每个工作目录一个细线框，目录名嵌在上边框里。
 
-被截断的 window 名或 pane 文字，鼠标停在上面（或树有焦点时光标在那一行）时，会在同一行、侧边栏外侧弹出一个单行的深色标签显示全文（tmux ≥ 3.8，用浮动 pane 实现，不抢焦点）。更早的 tmux 没有浮动 pane，改为原地滚动：约 0.35 秒后开始，每列约 70ms，到头稍停再滚回来。
+被截断的目录名或 pane 文字，鼠标停在上面（或树有焦点时光标在那一行）时，会在同一行、侧边栏外侧弹出一个单行的深色标签显示全文（tmux ≥ 3.8，用浮动 pane 实现，不抢焦点）。更早的 tmux 没有浮动 pane，改为原地滚动：约 0.35 秒后开始，每列约 70ms，到头稍停再滚回来。
 
 ## 分割
 
@@ -80,8 +81,8 @@ run-shell ~/.tmux/plugins/tmux-arbor/arbor.tmux
 
 | 模式 | 宽度 | 显示 | 进入方式 |
 | --- | --- | --- | --- |
-| 完整 | 14–64 列 | window 标题、pane 命令、树结构 | 拖动分隔线 · 聚焦后 `>` · `r` · prefix `W` |
-| 窄条 | 7 列 | 只有 window 编号 | 拖到 14 列以下 · 聚焦后 `<` 到底 · `r` · prefix `W` |
+| 完整 | 14–64 列 | 目录名、pane 命令、window 角标 | 拖动分隔线 · 聚焦后 `>` · `r` · prefix `W` |
+| 窄条 | 7 列 | 按目录分隔的 window.pane 编号 | 拖到 14 列以下 · 聚焦后 `<` 到底 · `r` · prefix `W` |
 | 隐藏 | 0 | 状态栏恢复 window 列表 | 拖到 4 列以下 · prefix `Tab` · 状态栏 `≡` · prefix `W` |
 
 每次调整都写入 `@arbor-width`，所有 window 的侧边栏一起跟着变；隐藏后再打开会回到隐藏前的模式和列数。双击分隔线或聚焦后按 `=` 回到默认宽度。终端本身改变大小时侧边栏保持列数不变。
@@ -102,10 +103,11 @@ prefix 快捷键不抢焦点，随时可用；聚焦侧边栏后进入 vim 风�
 | 聚焦时 | 作用 |
 | --- | --- |
 | `j` `k` `↑` `↓` | 移动光标 |
-| `h` `l` `←` `→` `␣` | 折叠 / 展开；`h` 在 pane 上回到父级 |
-| `⏎` | 切过去并交还焦点 |
-| `1`–`9` | 直接切到第 N 个 window（焦点留在树上） |
-| `J` `K` | 下移 / 上移 window 或 pane |
+| `h` `l` `←` `→` `␣` | 折叠 / 展开目录；`h` 在 pane 上回到所属目录 |
+| `⏎` | 切过去并交还焦点（在目录上为折叠 / 展开） |
+| `c` | 在当前目录新建 window |
+| `1`–`9` | 直接切到第 N 个可见 pane |
+| `J` `K` | 下移 / 上移目录组或同目录内的 pane |
 | `<` `>` | 宽度 −2 / +2 列，到底吸附窄条 |
 | `=` | 恢复默认宽度 |
 | `r` | 窄条 ⇄ 完整 |
@@ -114,32 +116,30 @@ prefix 快捷键不抢焦点，随时可用；聚焦侧边栏后进入 vim 风�
 
 ## 鼠标
 
-拖动超过一格才算拖拽，否则按单击处理。拖拽时底部显示会发生什么（"放到 3:git 之前"、"合并进 server"……）。
+拖动超过一格才算拖拽，否则按单击处理。拖拽时底部显示会发生什么（"放到 api-server/ 之前"、"与 nvim 合并分屏 (w0)"……）。
 
 | 操作 | 效果 | 对应命令 |
 | --- | --- | --- |
-| 单击 window | 切换 | `select-window` |
+| 单击目录行 | 折叠 / 展开目录 | 记在 session 选项 `@arbor-collapsed-dirs` |
+| 悬停目录行点 `+` | 在该目录新建 window | `new-window -c` |
 | 单击 pane | 切换并聚焦 | `select-pane` |
-| 单击 `▸` `▾` | 折叠 / 展开 | 记在 window 选项 `@arbor-collapsed` |
 | 拖动分隔线 | 调宽度，吸附窄条 / 隐藏 | `resize-pane`（tmux 原生） |
 | 双击分隔线 | 恢复默认宽度 | |
-| 拖 window 到另一个 window 上半 / 下半 | 放到它之前 / 之后 | `move-window -b` / `-a` |
-| 拖 pane 到另一个 window | 合并进去 | `join-pane` |
+| 拖目录到另一个目录上半 / 下半 | 整体重排该目录的 window 顺序 | `move-window -b` / `-a` |
+| 拖 pane 到另一个 window 的 pane | 合并分屏（保留各自 cwd） | `join-pane` |
 | 拖 pane 到同 window 的另一个 pane | 交换位置 | `swap-pane` |
 | 拖 pane 到「+ 拆成新 window」 | 拆出 | `break-pane` |
 | 状态栏 `≡` | 显示 / 隐藏 | `arbor toggle` |
 | 单击 `◫` / `⊟` | 分割工作区的当前 pane | 你自己的 `split-window` 绑定 |
 | 悬停在 `◫` / `⊟` 上 | 提示分割方向和你的按键 | |
-| 悬停在被截断的名字上 | 侧边栏外侧弹出单行全文（旧版 tmux：原地滚动） | `new-pane -d -B none`（浮动 pane） |
+| 悬停在目录或被截断的名字上 | 侧边栏外侧弹出单行完整信息（旧版 tmux：原地滚动） | `new-pane -d -B none`（浮动 pane） |
 
 ## 配置
 
 ```tmux
-# 树上的 window 文字直接读这两项，按你的习惯改即可
-set -g window-status-format         '#I:#W#F'
-set -g window-status-current-format '#I:#W#F'
-
-set -g @arbor-window-format         ''          # 留空 = 跟随 tmux
+set -g @arbor-group-by              'cwd'       # cwd | git
+set -g @arbor-dir-display           'smart'     # smart（智能去重目录名）| short（~/w/...）
+set -g @arbor-dir-sort              'window'    # window | alpha | active
 set -g @arbor-pane-format           ''          # pane 行的文字；留空 = 正在运行的命令
 set -g @arbor-hide-status-windows   on          # 打开时去掉状态栏 window 列表
 set -g @arbor-status-button         on          # 状态栏最左边的 ≡ 按钮
@@ -147,14 +147,14 @@ set -g @arbor-position              'left'      # left | right
 set -g @arbor-width                 '28'        # 完整模式列数，拖动后自动更新
 set -g @arbor-default-width         '28'        # = 和双击分隔线回到的宽度
 set -g @arbor-mode                  'full'      # full | rail | hidden
-set -g @arbor-style                 'branches'  # branches | blocks | map
+set -g @arbor-style                 'branches'  # branches/indent | tree | blocks
 set -g @arbor-label-styles          on          # 是否使用格式里的 #[…] 样式
 set -g @arbor-theme                 'auto'      # auto | light | dark
 set -g @arbor-bg                    ''          # 侧边栏底色，如 '#e7e7ea'；留空用终端底色
 set -g @arbor-lang                  'zh'        # zh | en
 set -g @arbor-hints                 on          # 底部按键提示
 set -g @arbor-buttons               on          # 标题行右侧的分割按钮
-set -g @arbor-interval              '2'         # 可见时每隔几秒检查 pane 命令；0 关闭
+set -g @arbor-interval              '2'         # 可见时每隔几秒检查 pane 命令与目录；0 关闭
 set -g @arbor-key-toggle            'Tab'       # 'none' 表示不绑定
 set -g @arbor-key-focus             'T'
 set -g @arbor-key-cycle             'W'

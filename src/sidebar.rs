@@ -1,7 +1,7 @@
-//! The process inside the sidebar pane: draws the tree, reads keys and
-//! mouse, and turns them into tmux commands. It redraws when a hook signals
-//! it (SIGUSR1), re-detects the theme on SIGUSR2, and handles its own
-//! resizes on SIGWINCH.
+//! The process inside the sidebar pane: draws the 2-level Directory -> Pane
+//! tree, reads keys and mouse, and turns them into tmux commands. It redraws
+//! when a hook signals it (SIGUSR1), re-detects the theme on SIGUSR2, and
+//! handles its own resizes on SIGWINCH.
 
 use std::cell::{Cell, RefCell};
 use std::io::{self, Read};
@@ -15,7 +15,7 @@ use crate::cli;
 use crate::config::{Config, HIDE_BELOW, MAX_W, MIN_FULL, Mode, Side, Theme};
 use crate::input::{Event, Key, Mouse, MouseKind, Parser};
 use crate::label::parse_color;
-use crate::model::{NodeKey, Snapshot, expanded, pane_number};
+use crate::model::{self, COLLAPSED_SEP, DirGroup, NodeKey, Snapshot, pane_number, shorten_home};
 use crate::screen::{Canvas, truncate, width};
 use crate::split;
 use crate::strings::{Strings, wrap};
@@ -94,7 +94,7 @@ struct Press {
 /// What the last frame put where, for mouse hit-testing.
 struct Frame {
     screen: Canvas<Hit>,
-    /// Window groups in screen rows (may run off either end).
+    /// Directory groups in screen rows (may run off either end).
     groups: Vec<(String, i32, i32)>,
     list_top: u16,
     list_h: u16,
@@ -111,6 +111,7 @@ struct App {
     parser: Parser,
     cursor: Option<NodeKey>,
     hover: Option<NodeKey>,
+    hover_add: Option<String>,
     hover_split: Option<char>,
     hover_until: Option<Instant>,
     last_motion: Option<Instant>,
@@ -179,6 +180,7 @@ impl App {
             parser: Parser::default(),
             cursor: None,
             hover: None,
+            hover_add: None,
             hover_split: None,
             hover_until: None,
             last_motion: None,
@@ -246,7 +248,6 @@ impl App {
                 // tmux reflows the pane on resize: write every row again.
                 self.last_rows.clear();
                 self.resize_at = Some(Instant::now() + RESIZE_SETTLE);
-                // Still moving: not a drag tmux forgot to end.
                 if self.drag_check_at.is_some() {
                     self.drag_check_at = Some(Instant::now() + DRAG_STALE);
                 }
@@ -301,6 +302,7 @@ impl App {
         if due(self.hover_until) {
             self.hover_until = None;
             self.hover = None;
+            self.hover_add = None;
             self.hover_split = None;
             self.draw();
         }
@@ -405,13 +407,14 @@ impl App {
             self.quit = true;
             return;
         }
+        let rail = snap.cfg.mode == Mode::Rail || self.size.0 < MIN_FULL;
+        let nodes = snap.nodes(rail);
         let focused = snap.focused();
         if focused && !self.was_focused {
-            self.cursor = snap.current().map(|w| NodeKey::Window(w.id.clone()));
+            self.cursor = snap.focused_pane().map(NodeKey::Pane).or_else(|| nodes.first().cloned());
             self.reveal = self.cursor.clone();
         }
         self.was_focused = focused;
-        // A drag just ended and settled the width: say what it became.
         if self.was_dragging && !snap.dragging {
             let before = self.snap.as_ref().map(|s| (s.cfg.mode, s.cfg.width));
             if before != Some((snap.cfg.mode, snap.cfg.width)) {
@@ -424,21 +427,22 @@ impl App {
             self.drag_check_at = None;
         }
         self.key_focus = false;
-        let current = snap.current().map(|w| w.id.clone());
+        let current = snap.focused_pane();
         if current != self.last_current {
-            self.reveal = self.reveal.take().or_else(|| current.clone().map(NodeKey::Window));
+            self.reveal = self.reveal.take().or_else(|| current.clone().map(NodeKey::Pane));
             self.last_current = current;
             self.hover = None;
+            self.hover_add = None;
         }
-        let rail = snap.cfg.mode == Mode::Rail || self.size.0 < MIN_FULL;
         if let Some(c) = &self.cursor
-            && !snap.nodes(rail).contains(c)
+            && !nodes.contains(c)
         {
             self.cursor = match c {
-                NodeKey::Pane(p) => snap.find_pane(p).map(|(w, _)| NodeKey::Window(w.id.clone())),
-                NodeKey::Window(_) => None,
+                NodeKey::Pane(p) => snap.pane_group_dir(p).map(NodeKey::Dir).filter(|d| nodes.contains(d)),
+                NodeKey::Dir(_) => None,
             }
-            .or_else(|| snap.current().map(|w| NodeKey::Window(w.id.clone())));
+            .or_else(|| snap.focused_pane().map(NodeKey::Pane).filter(|k| nodes.contains(k)))
+            .or_else(|| nodes.first().cloned());
         }
         self.tick_at =
             (snap.cfg.interval > 0 && snap.visible()).then(|| Instant::now() + Duration::from_secs(snap.cfg.interval));
@@ -449,8 +453,6 @@ impl App {
     fn refresh(&mut self) {
         self.refresh_at = None;
         let Some(snap) = self.query() else { return };
-        // Hooks fire for things the tree does not show (a popup opening,
-        // say); redraw only when something it shows changed.
         let focused = self.focused();
         let changed = self.snap.as_ref() != Some(&snap);
         self.apply(snap);
@@ -486,8 +488,6 @@ impl App {
         if snap.docked(cfg.position) && snap.pane_width == cfg.cols() {
             return;
         }
-        // A window too narrow for the width would otherwise be retried on
-        // every redraw.
         let key = (cfg.cols(), snap.window_width);
         if self.last_fix.is_some_and(|(t, k)| k == key && t.elapsed() < Duration::from_secs(1)) {
             return;
@@ -515,12 +515,7 @@ impl App {
             self.draw();
             return;
         }
-        // Only dragging the divider changes the width on purpose. Layout
-        // commands, splits and terminal resizes are put back.
         if docked && snap.dragging {
-            // tmux moves the divider with the pointer, and resizing under it
-            // would lose the drag: show where it would land, and settle on
-            // release (arbor drag-end).
             let text = self.strings();
             self.say(match w {
                 w if w < HIDE_BELOW => text.release_hides(),
@@ -553,6 +548,7 @@ impl App {
             Event::FocusIn | Event::FocusOut => {
                 if ev == Event::FocusOut {
                     self.hover = None;
+                    self.hover_add = None;
                 }
                 self.refresh_at.get_or_insert(Instant::now());
             }
@@ -567,55 +563,72 @@ impl App {
     fn key(&mut self, k: Key) {
         let Some(snap) = self.snap.clone() else { return };
         let rail = self.rail();
+        let groups = snap.groups();
         let nodes = snap.nodes(rail);
         if nodes.is_empty() {
             return;
         }
-        let current = snap.current().map(|w| NodeKey::Window(w.id.clone()));
+        let current = snap.focused_pane().map(NodeKey::Pane);
         let i = self.cursor.as_ref().or(current.as_ref()).and_then(|c| nodes.iter().position(|n| n == c)).unwrap_or(0);
         let node = nodes[i].clone();
-        let window = match &node {
-            NodeKey::Window(w) => snap.window(w),
-            NodeKey::Pane(_) => None,
-        };
-        let foldable = window.is_some_and(|w| !rail && w.panes.len() > 1);
         let text = self.strings();
         let mut cfg = snap.cfg.clone();
+
         match k {
             Key::Char('j') | Key::Down => self.move_cursor(nodes.get(i + 1)),
             Key::Char('k') | Key::Up => self.move_cursor(i.checked_sub(1).and_then(|j| nodes.get(j))),
             Key::Char('l') | Key::Right => {
-                if let Some(w) = window.filter(|_| foldable) {
-                    if w.collapsed {
-                        self.set_collapsed(&w.id, false);
+                if let NodeKey::Dir(dir) = &node {
+                    if snap.collapsed_dirs.contains(dir) {
+                        self.set_dir_collapsed(dir, false);
                     } else {
                         self.move_cursor(nodes.get(i + 1));
                     }
                 }
             }
-            Key::Char('h') | Key::Left => match (&node, window) {
-                (_, Some(w)) if foldable && expanded(w, rail) => self.set_collapsed(&w.id, true),
-                (NodeKey::Pane(p), _) => {
-                    let parent = snap.find_pane(p).map(|(w, _)| NodeKey::Window(w.id.clone()));
-                    self.move_cursor(parent.as_ref());
+            Key::Char('h') | Key::Left => match &node {
+                NodeKey::Dir(dir) if !snap.collapsed_dirs.contains(dir) => self.set_dir_collapsed(dir, true),
+                NodeKey::Pane(pid) => {
+                    if let Some(dir) = snap.pane_group_dir(pid) {
+                        self.move_cursor(Some(&NodeKey::Dir(dir)));
+                    }
                 }
                 _ => {}
             },
             Key::Char(' ') => {
-                if let Some(w) = window.filter(|_| foldable) {
-                    self.set_collapsed(&w.id, !w.collapsed);
+                if let NodeKey::Dir(dir) = &node {
+                    self.set_dir_collapsed(dir, !snap.collapsed_dirs.contains(dir));
                 }
             }
-            Key::Enter => self.activate(&node),
-            Key::Char(d @ '1'..='9') => {
+            Key::Enter => match &node {
+                NodeKey::Dir(dir) => self.set_dir_collapsed(dir, !snap.collapsed_dirs.contains(dir)),
+                NodeKey::Pane(pid) => {
+                    if let Some((w, _)) = snap.find_pane(pid) {
+                        self.goto_pane(&w.id.clone(), pid);
+                    }
+                }
+            },
+            Key::Char('c') => {
+                let dir = match &node {
+                    NodeKey::Dir(d) => Some(d.clone()),
+                    NodeKey::Pane(p) => snap.pane_group_dir(p),
+                };
+                if let Some(dir) = dir {
+                    self.create_window_in_dir(&dir);
+                }
+            }
+            Key::Char('1'..='9') => {
+                let Key::Char(d) = k else { unreachable!() };
                 let n = d as usize - '1' as usize;
-                if let Some(w) = snap.windows.get(n) {
-                    self.cursor = Some(NodeKey::Window(w.id.clone()));
-                    self.goto_window(&w.id.clone(), true);
+                if let Some(NodeKey::Pane(pid)) = nodes.iter().filter(|k| matches!(k, NodeKey::Pane(_))).nth(n)
+                    && let Some((w, _)) = snap.find_pane(pid)
+                {
+                    self.cursor = Some(NodeKey::Pane(pid.clone()));
+                    self.goto_pane(&w.id.clone(), pid);
                 }
             }
-            Key::Char('J') => self.shift(&node, 1),
-            Key::Char('K') => self.shift(&node, -1),
+            Key::Char('J') => self.shift(&node, &groups, 1),
+            Key::Char('K') => self.shift(&node, &groups, -1),
             Key::Char(c @ ('<' | '>')) => {
                 if cli::step_width(&mut cfg, if c == '<' { -2 } else { 2 }) {
                     self.say(if cfg.mode == Mode::Rail { text.rail() } else { text.cols_saved(cfg.width) });
@@ -654,17 +667,39 @@ impl App {
         }
     }
 
-    fn set_collapsed(&mut self, wid: &str, collapsed: bool) {
-        let r = if collapsed {
-            tmux::run(["set-option", "-w", "-t", wid, "@arbor-collapsed", "1"])
+    fn set_dir_collapsed(&mut self, raw_path: &str, collapsed: bool) {
+        let Some(snap) = &mut self.snap else { return };
+        let sid = snap.session_id.clone();
+        if collapsed {
+            snap.collapsed_dirs.insert(raw_path.to_string());
         } else {
-            tmux::run(["set-option", "-wu", "-t", wid, "@arbor-collapsed"])
+            snap.collapsed_dirs.remove(raw_path);
+        }
+        let val: String = snap.collapsed_dirs.iter().cloned().collect::<Vec<_>>().join(&COLLAPSED_SEP.to_string());
+        let r = if val.is_empty() {
+            tmux::run(["set-option", "-su", "-t", &sid, "@arbor-collapsed-dirs"])
+        } else {
+            tmux::run(["set-option", "-s", "-t", &sid, "@arbor-collapsed-dirs", &val])
         };
         if r.is_ok() {
-            if let Some(w) = self.snap.as_mut().and_then(|s| s.window_mut(wid)) {
-                w.collapsed = collapsed;
-            }
             let _ = cli::notify(libc::SIGUSR1);
+        }
+    }
+
+    fn create_window_in_dir(&mut self, raw_path: &str) {
+        let Some(snap) = self.snap.clone() else { return };
+        if snap.collapsed_dirs.contains(raw_path) {
+            self.set_dir_collapsed(raw_path, false);
+        }
+        let label = snap
+            .groups()
+            .into_iter()
+            .find(|g| g.raw_path == raw_path)
+            .map(|g| g.label)
+            .unwrap_or_else(|| shorten_home(raw_path, model::home_dir()));
+        let text = self.strings();
+        if tmux::run(["new-window", "-t", &snap.session_id, "-c", raw_path]).is_ok() {
+            self.say(text.new_window_in(&label));
         }
     }
 
@@ -682,41 +717,6 @@ impl App {
         let _ = b.run();
     }
 
-    fn activate(&mut self, node: &NodeKey) {
-        match node {
-            NodeKey::Window(w) => self.goto_window(&w.clone(), false),
-            NodeKey::Pane(p) => {
-                if let Some((w, _)) = self.snap.as_ref().and_then(|s| s.find_pane(p)) {
-                    let wid = w.id.clone();
-                    self.goto_pane(&wid, &p.clone());
-                }
-            }
-        }
-    }
-
-    /// Switches to a window. With `keep_tree` the keyboard stays in the
-    /// tree, in that window's sidebar.
-    fn goto_window(&mut self, wid: &str, keep_tree: bool) {
-        let Some(snap) = &self.snap else { return };
-        let mut b = Batch::new();
-        if wid == snap.window_id {
-            if !keep_tree {
-                self.leave_cmd(&mut b);
-            }
-            let _ = b.run();
-            return;
-        }
-        self.leave_cmd(&mut b);
-        b.cmd(["select-window", "-t", wid]);
-        if b.run().is_err() || !keep_tree {
-            return;
-        }
-        let _ = cli::sync(&snap.cfg, Some(wid));
-        if let Some(sb) = cli::window_rows(wid).ok().and_then(|rows| rows.into_iter().find(|r| r.sidebar)) {
-            let _ = tmux::run(["select-pane", "-t", &sb.pane]);
-        }
-    }
-
     fn goto_pane(&mut self, wid: &str, pid: &str) {
         let Some(snap) = &self.snap else { return };
         let mut b = Batch::new();
@@ -728,31 +728,84 @@ impl App {
         let _ = b.run();
     }
 
-    /// J / K: moves a window or pane one place down or up.
-    fn shift(&mut self, node: &NodeKey, d: i32) {
+    /// J / K: moves a directory group or pane one place down or up.
+    fn shift(&mut self, node: &NodeKey, groups: &[DirGroup], d: i32) {
         let Some(snap) = self.snap.clone() else { return };
+        let text = self.strings();
         match node {
-            NodeKey::Window(wid) => {
-                let Some(i) = snap.windows.iter().position(|w| &w.id == wid) else { return };
-                let Some(other) = (i as i32 + d).try_into().ok().and_then(|j: usize| snap.windows.get(j)) else {
+            NodeKey::Dir(dir) => {
+                let Some(i) = groups.iter().position(|g| &g.raw_path == dir) else { return };
+                let Some(other) = (i as i32 + d).try_into().ok().and_then(|j: usize| groups.get(j)) else {
                     return;
                 };
-                // Which window stays current after swap-window differs
-                // between tmux versions; put back the one that was.
-                let Ok(current) = tmux::run(["display-message", "-p", "-t", &snap.session_id, "#{window_id}"]) else {
-                    return;
-                };
-                let _ = Batch::new()
-                    .cmd(["swap-window", "-s", wid, "-t", &other.id])
-                    .cmd(["select-window", "-t", current.trim()])
-                    .run();
+                self.reorder_dir(&snap, groups, dir, &other.raw_path, d > 0);
             }
             NodeKey::Pane(pid) => {
-                let Some((w, i)) = snap.find_pane(pid) else { return };
-                let Some(other) = (i as i32 + d).try_into().ok().and_then(|j: usize| w.panes.get(j)) else { return };
-                swap_panes(&w.id, pid, &other.id);
+                let Some(dir) = snap.pane_group_dir(pid) else { return };
+                let Some(g) = groups.iter().find(|g| g.raw_path == dir) else { return };
+                let Some(i) = g.items.iter().position(|it| &it.pane.id == pid) else { return };
+                let Some(other) = (i as i32 + d).try_into().ok().and_then(|j: usize| g.items.get(j)) else {
+                    self.say(text.at_dir_edge());
+                    return;
+                };
+                let cur = &g.items[i];
+                if cur.wid == other.wid {
+                    swap_panes(&cur.wid, pid, &other.pane.id);
+                } else {
+                    move_window(&snap.session_id, &cur.wid, &other.wid, d > 0);
+                }
             }
         }
+    }
+
+    fn reorder_dir(&self, snap: &Snapshot, groups: &[DirGroup], src_dir: &str, dst_dir: &str, after: bool) {
+        let Some(src_g) = groups.iter().find(|g| g.raw_path == src_dir) else { return };
+        let Some(dst_g) = groups.iter().find(|g| g.raw_path == dst_dir) else { return };
+        let anchor = if after { dst_g.items.last() } else { dst_g.items.first() }.map(|it| it.wid.clone());
+        let Some(anchor) = anchor else { return };
+
+        let mut src_wids: Vec<String> = Vec::new();
+        for it in &src_g.items {
+            if it.wid != anchor && !src_wids.contains(&it.wid) {
+                src_wids.push(it.wid.clone());
+            }
+        }
+        if src_wids.is_empty() {
+            return;
+        }
+        let Ok(current) = tmux::run(["display-message", "-p", "-t", &snap.session_id, "#{window_id}"]) else {
+            return;
+        };
+        let mut b = Batch::new();
+        if after {
+            let mut prev = anchor;
+            for w in &src_wids {
+                b.cmd([
+                    "move-window",
+                    "-d",
+                    "-a",
+                    "-s",
+                    &format!("{}:{w}", snap.session_id),
+                    "-t",
+                    &format!("{}:{prev}", snap.session_id),
+                ]);
+                prev = w.clone();
+            }
+        } else {
+            for w in &src_wids {
+                b.cmd([
+                    "move-window",
+                    "-d",
+                    "-b",
+                    "-s",
+                    &format!("{}:{w}", snap.session_id),
+                    "-t",
+                    &format!("{}:{anchor}", snap.session_id),
+                ]);
+            }
+        }
+        b.cmd(["select-window", "-t", current.trim()]);
+        let _ = b.run();
     }
 
     // ---- mouse -----------------------------------------------------------
@@ -765,15 +818,6 @@ impl App {
         let hit = self.hit_at(m.x, m.y);
         match m.kind {
             MouseKind::Press(0) => {
-                if let Hit::Chevron(wid) = &hit
-                    && let Some(w) = self.snap.as_ref().and_then(|s| s.window(wid))
-                {
-                    let collapsed = !w.collapsed;
-                    self.cursor = Some(NodeKey::Window(wid.clone()));
-                    self.set_collapsed(&wid.clone(), collapsed);
-                    self.draw();
-                    return;
-                }
                 self.press = Some(Press { x: m.x, y: m.y, hit });
             }
             MouseKind::Drag(0) => {
@@ -783,11 +827,15 @@ impl App {
                         return;
                     }
                     let src = match &p.hit {
-                        Hit::Window(w) => (NodeKey::Window(w.clone()), w.clone()),
-                        Hit::Pane { wid, pid } => (NodeKey::Pane(pid.clone()), wid.clone()),
+                        Hit::Dir(d) => (NodeKey::Dir(d.clone()), String::new(), d.clone(), 0),
+                        Hit::Pane { wid, pid, dir } => {
+                            let win_panes = self.snap.as_ref().and_then(|s| s.window(wid)).map_or(1, |w| w.panes.len());
+                            (NodeKey::Pane(pid.clone()), wid.clone(), dir.clone(), win_panes)
+                        }
                         _ => return,
                     };
-                    self.drag = Some(Drag { src: src.0, src_wid: src.1, target: None });
+                    self.drag =
+                        Some(Drag { src: src.0, src_wid: src.1, src_dir: src.2, src_win_panes: src.3, target: None });
                 }
                 let target = self.drop_target(m.x, m.y);
                 if let Some(d) = &mut self.drag {
@@ -810,12 +858,14 @@ impl App {
             }
             MouseKind::Move => {
                 let hover = hit.node();
+                let hover_add = match &hit {
+                    Hit::DirAdd(d) => Some(d.clone()),
+                    _ => None,
+                };
                 let hover_split = match hit {
                     Hit::Split(d) => Some(d),
                     _ => None,
                 };
-                // The sidebar is full height: the pointer leaves it towards
-                // the work area.
                 let edge = match self.cfg().position {
                     Side::Left => m.x + 1 >= self.size.0,
                     Side::Right => m.x == 0,
@@ -824,8 +874,9 @@ impl App {
                 self.hover_until = Some(now + if edge { HOVER_EDGE } else { HOVER_IDLE });
                 self.last_motion = Some(now);
                 self.hover_edge = edge;
-                if hover != self.hover || hover_split != self.hover_split {
+                if hover != self.hover || hover_add != self.hover_add || hover_split != self.hover_split {
                     self.hover = hover;
+                    self.hover_add = hover_add;
                     self.hover_split = hover_split;
                     self.draw();
                 }
@@ -837,9 +888,8 @@ impl App {
                 } else {
                     (self.scroll + 3).min(max)
                 };
-                // Scrolling moves the rows from under the pointer; the
-                // design drops tooltips on the wheel too.
                 self.hover = None;
+                self.hover_add = None;
                 self.hover_split = None;
                 self.draw();
             }
@@ -849,11 +899,17 @@ impl App {
 
     fn click(&mut self, hit: &Hit) {
         match hit {
-            Hit::Window(wid) => {
-                self.cursor = Some(NodeKey::Window(wid.clone()));
-                self.goto_window(&wid.clone(), false);
+            Hit::DirAdd(dir) => self.create_window_in_dir(dir),
+            Hit::Dir(dir) => {
+                let collapsed = self.snap.as_ref().is_some_and(|s| s.collapsed_dirs.contains(dir));
+                self.cursor = Some(NodeKey::Dir(dir.clone()));
+                self.set_dir_collapsed(dir, !collapsed);
+                if !self.was_focused {
+                    let _ = cli::focus_work(&self.pane);
+                }
+                self.draw();
             }
-            Hit::Pane { wid, pid } => {
+            Hit::Pane { wid, pid, .. } => {
                 self.cursor = Some(NodeKey::Pane(pid.clone()));
                 self.goto_pane(&wid.clone(), &pid.clone());
             }
@@ -882,40 +938,38 @@ impl App {
         let drag = self.drag.as_ref()?;
         let snap = self.snap.as_ref()?;
         match &drag.src {
-            NodeKey::Window(src) => {
+            NodeKey::Dir(src) => {
                 if y < frame.list_top || y >= frame.list_top + frame.list_h {
                     return None;
                 }
                 let yy = y as i32;
-                let g = frame.groups.iter().position(|g| yy >= g.1 && yy <= g.2).or_else(|| {
-                    // Below the last window: after it.
-                    frame.groups.last().filter(|g| yy > g.2).map(|_| frame.groups.len() - 1)
-                })?;
-                let (wid, y0, y1) = &frame.groups[g];
-                if wid == src {
+                let g = frame
+                    .groups
+                    .iter()
+                    .position(|g| yy >= g.1 && yy <= g.2)
+                    .or_else(|| frame.groups.last().filter(|g| yy > g.2).map(|_| frame.groups.len() - 1))?;
+                let (dir, y0, y1) = &frame.groups[g];
+                if dir == src {
                     return None;
                 }
-                let src_i = snap.windows.iter().position(|w| &w.id == src)?;
-                // Upper half goes before; a one-row window goes the way the
-                // drag is heading.
+                let groups = snap.groups();
+                let src_i = groups.iter().position(|gr| &gr.raw_path == src)?;
                 let before = if y1 > y0 { (yy - y0) * 2 < y1 - y0 + 1 } else { g < src_i };
                 let before = before && yy <= *y1;
-                Some(if before { Target::Before(wid.clone()) } else { Target::After(wid.clone()) })
+                Some(if before { Target::DirBefore(dir.clone()) } else { Target::DirAfter(dir.clone()) })
             }
             NodeKey::Pane(src) => match frame.screen.hit(x, y)? {
-                Hit::NewWindow => Some(Target::Break),
-                Hit::Pane { wid, pid } => {
+                Hit::NewWindow if drag.src_win_panes > 1 => Some(Target::Break),
+                Hit::Pane { wid, pid, .. } => {
                     if pid == src {
                         None
                     } else if *wid == drag.src_wid {
                         Some(Target::Swap(pid.clone()))
                     } else {
-                        Some(Target::Join { wid: wid.clone(), pane: Some(pid.clone()) })
+                        Some(Target::Join { wid: wid.clone(), pid: pid.clone() })
                     }
                 }
-                Hit::Window(wid) | Hit::Chevron(wid) if *wid != drag.src_wid => {
-                    Some(Target::Join { wid: wid.clone(), pane: None })
-                }
+                Hit::Dir(d) | Hit::DirAdd(d) if *d != drag.src_dir => Some(Target::Invalid),
                 _ => None,
             },
         }
@@ -923,43 +977,27 @@ impl App {
 
     fn drop(&mut self, d: &Drag, t: Target) {
         let Some(snap) = self.snap.clone() else { return };
-        let sid = &snap.session_id;
         match (&d.src, &t) {
-            (NodeKey::Window(src), Target::Before(dst) | Target::After(dst)) => {
-                let (Some(si), Some(di)) =
-                    (snap.windows.iter().position(|w| &w.id == src), snap.windows.iter().position(|w| &w.id == dst))
-                else {
-                    return;
-                };
-                let after = matches!(t, Target::After(_));
-                // Already there.
-                if (after && di + 1 == si) || (!after && si + 1 == di) {
-                    return;
-                }
-                let _ = tmux::run([
-                    "move-window",
-                    "-d",
-                    if after { "-a" } else { "-b" },
-                    "-s",
-                    &format!("{sid}:{src}"),
-                    "-t",
-                    &format!("{sid}:{dst}"),
-                ]);
+            (NodeKey::Dir(src), Target::DirBefore(dst) | Target::DirAfter(dst)) => {
+                let groups = snap.groups();
+                self.reorder_dir(&snap, &groups, src, dst, matches!(t, Target::DirAfter(_)));
             }
             (NodeKey::Pane(src), Target::Swap(dst)) => swap_panes(&d.src_wid, src, dst),
-            (NodeKey::Pane(src), Target::Join { wid, pane }) => {
-                let dst = pane.clone().or_else(|| snap.window(wid).and_then(|w| w.work_target()).map(str::to_string));
-                if let Some(dst) = dst {
-                    let _ = tmux::run(["join-pane", "-s", src, "-t", &dst]);
-                }
+            (NodeKey::Pane(src), Target::Join { pid, .. }) => {
+                let _ = tmux::run(["join-pane", "-s", src, "-t", pid]);
             }
             (NodeKey::Pane(src), Target::Break) => {
                 let _ = tmux::run(["break-pane", "-s", src]);
             }
+            (_, Target::Invalid) => {
+                let text = self.strings();
+                self.say(text.dir_cwd_hint());
+                let _ = cli::focus_work(&self.pane);
+                return;
+            }
             _ => return,
         }
         self.cursor = Some(d.src.clone());
-        // The mouse press made the sidebar active; give the keyboard back.
         let _ = cli::focus_work(&self.pane);
     }
 
@@ -968,11 +1006,12 @@ impl App {
     fn footer(&self, ctx: &Ctx, text: &Strings, focused: bool) -> Footer {
         if let Some(d) = &self.drag {
             let hint = match &d.target {
+                Some(Target::Invalid) => (text.dir_cwd_hint(), false),
                 Some(t) => (self.target_hint(t, text), true),
                 None => (text.cannot_drop(), false),
             };
-            let zone =
-                matches!(d.src, NodeKey::Pane(_)).then(|| (text.new_window_zone(), d.target == Some(Target::Break)));
+            let zone = (matches!(d.src, NodeKey::Pane(_)) && d.src_win_panes > 1)
+                .then(|| (text.new_window_zone(), d.target == Some(Target::Break)));
             return Footer { drag: Some(hint), zone, ..Footer::default() };
         }
         if let Some((m, _)) = &self.msg {
@@ -990,18 +1029,26 @@ impl App {
 
     fn target_hint(&self, t: &Target, text: &Strings) -> String {
         let snap = self.snap.as_ref();
-        let wname =
-            |id: &str| snap.and_then(|s| s.window(id)).map(|w| w.label.plain().trim().to_string()).unwrap_or_default();
+        let groups = snap.map(Snapshot::groups).unwrap_or_default();
+        let dname = |raw: &str| {
+            groups.iter().find(|g| g.raw_path == raw).map(|g| g.label.clone()).unwrap_or_else(|| raw.to_string())
+        };
+        let pinfo = |pid: &str| {
+            snap.and_then(|s| s.find_pane(pid)).map(|(w, i)| (w.panes[i].cmd.clone(), w.index)).unwrap_or_default()
+        };
         match t {
-            Target::Before(w) => text.before(&wname(w)),
-            Target::After(w) => text.after(&wname(w)),
-            Target::Join { wid, .. } => {
-                text.join(&snap.and_then(|s| s.window(wid)).map(|w| w.name.clone()).unwrap_or_default())
+            Target::DirBefore(d) => text.before(&dname(d)),
+            Target::DirAfter(d) => text.after(&dname(d)),
+            Target::Join { pid, .. } => {
+                let (cmd, widx) = pinfo(pid);
+                text.join_pane(&cmd, widx)
             }
             Target::Swap(p) => {
-                text.swap(&snap.and_then(|s| s.find_pane(p)).map(|(w, i)| w.panes[i].cmd.clone()).unwrap_or_default())
+                let (cmd, _) = pinfo(p);
+                text.swap(&cmd)
             }
             Target::Break => text.break_out(),
+            Target::Invalid => text.dir_cwd_hint(),
         }
     }
 
@@ -1072,15 +1119,20 @@ impl App {
         }
         let rail = self.rail();
         let text = Strings::new(snap.cfg.lang);
+        let groups = snap.groups();
         let ctx = Ctx {
             snap,
+            groups: &groups,
             pal: &self.pal,
+            text: &text,
+            home: model::home_dir(),
             width: w,
             rail,
             variant: snap.cfg.style,
             label_styles: snap.cfg.label_styles,
             cursor: if focused { self.cursor.as_ref() } else { None },
             hover: self.hover.as_ref(),
+            hover_add: self.hover_add.as_deref(),
             hover_split: self.hover_split,
             drag: self.drag.as_ref(),
             marquee: if self.floating { None } else { self.marquee.as_ref().map(|(k, t)| (k, t.elapsed())) },
@@ -1101,7 +1153,7 @@ impl App {
         let max_scroll = list.canvas.h.saturating_sub(list_h);
         if let Some(k) = self.reveal.take() {
             let rows = match &k {
-                NodeKey::Window(wid) => list.groups.iter().find(|g| &g.wid == wid).map(|g| (g.y0, g.y1)),
+                NodeKey::Dir(dir) => list.groups.iter().find(|g| &g.dir == dir).map(|g| (g.y0, g.y1)),
                 NodeKey::Pane(_) => list.nodes.iter().find(|n| n.0 == k).map(|n| (n.1, n.2)),
             };
             if let Some((a, b)) = rows {
@@ -1130,8 +1182,6 @@ impl App {
         }
         self.last_rows = rows;
 
-        // Keep a cut-off name moving. A pointer resting on it keeps it
-        // going for at least one full pass, past the usual hover timeout.
         let overflow = ctx.overflow.get();
         let popup = ctx.tip.borrow().as_ref().and_then(|t| self.place_popup(snap, t, header_h, list_h));
         self.anim_at = overflow.map(|_| Instant::now() + MARQUEE_FRAME);
@@ -1154,10 +1204,27 @@ impl App {
 
         let offset = header_h as i32 - self.scroll as i32;
         let groups =
-            list.groups.iter().map(|Group { wid, y0, y1 }| (wid.clone(), *y0 as i32 + offset, *y1 as i32 + offset));
+            list.groups.iter().map(|Group { dir, y0, y1 }| (dir.clone(), *y0 as i32 + offset, *y1 as i32 + offset));
         self.frame =
             Some(Frame { groups: groups.collect(), list_top: header_h, list_h, list_total: list.canvas.h, screen });
     }
+}
+
+/// Moves a window before/after another window, keeping the current window active.
+fn move_window(sid: &str, src_wid: &str, dst_wid: &str, after: bool) {
+    let Ok(current) = tmux::run(["display-message", "-p", "-t", sid, "#{window_id}"]) else { return };
+    let _ = Batch::new()
+        .cmd([
+            "move-window",
+            "-d",
+            if after { "-a" } else { "-b" },
+            "-s",
+            &format!("{sid}:{src_wid}"),
+            "-t",
+            &format!("{sid}:{dst_wid}"),
+        ])
+        .cmd(["select-window", "-t", current.trim()])
+        .run();
 }
 
 /// Swaps two panes of `window`, keeping its active pane (which may be the

@@ -16,24 +16,28 @@ impl Strings {
         if self.zh { zh.to_string() } else { en.to_string() }
     }
 
-    pub fn windows(&self, n: usize) -> String {
-        if n == 1 { "1 window".into() } else { format!("{n} windows") }
+    pub fn panes(&self, n: usize) -> String {
+        if n == 1 { "1 pane".into() } else { format!("{n} panes") }
+    }
+
+    pub fn panes_dirs(&self, p: usize, d: usize) -> String {
+        format!("{p}p · {d}d")
     }
 
     pub fn hints_focused(&self) -> Vec<String> {
         let list: &[&str] = if self.zh {
-            &["j k 移动", "h l 折叠", "⏎ 切换", "J K 排序", "< > 宽度", "q 退出"]
+            &["j k 移动", "h l 折叠", "⏎ 切换", "c 新建", "J K 排序", "< > 宽度", "q 退出"]
         } else {
-            &["j k move", "h l fold", "⏎ open", "J K reorder", "< > width", "q leave"]
+            &["j k move", "h l fold", "⏎ open", "c new", "J K reorder", "< > width", "q leave"]
         };
         list.iter().map(|s| s.to_string()).collect()
     }
 
     pub fn hints_idle(&self, prefix: &str) -> Vec<String> {
         if self.zh {
-            vec![format!("{prefix} T 键盘操作"), "拖动节点可重排".into()]
+            vec![format!("{prefix} T 键盘操作"), "拖动目录或 pane 可重排/合屏".into()]
         } else {
-            vec![format!("{prefix} T keyboard"), "drag to rearrange".into()]
+            vec![format!("{prefix} T keyboard"), "drag dir or pane to reorder".into()]
         }
     }
 
@@ -49,8 +53,20 @@ impl Strings {
         if self.zh { format!("与 {x} 交换位置") } else { format!("swap with {x}") }
     }
 
-    pub fn join(&self, x: &str) -> String {
-        if self.zh { format!("合并进 {x}") } else { format!("join {x}") }
+    pub fn join_pane(&self, name: &str, win_idx: u32) -> String {
+        if self.zh { format!("与 {name} 合并分屏 (w{win_idx})") } else { format!("join {name} (w{win_idx})") }
+    }
+
+    pub fn dir_cwd_hint(&self) -> String {
+        self.pick("目录由工作路径决定 · 拖至 pane 可合屏", "grouped by cwd · drop on a pane to join")
+    }
+
+    pub fn new_window_in(&self, label: &str) -> String {
+        if self.zh { format!("在 {label} 新建 window") } else { format!("new window in {label}") }
+    }
+
+    pub fn at_dir_edge(&self) -> String {
+        self.pick("已到达当前目录边界", "at directory boundary")
     }
 
     pub fn break_out(&self) -> String {

@@ -13,8 +13,6 @@ pub const MAX_W: u16 = 64;
 /// Dragging below this hides the sidebar.
 pub const HIDE_BELOW: u16 = 4;
 pub const DEFAULT_WIDTH: u16 = 28;
-/// Below this width the map style falls back to branches.
-pub const MAP_MIN: u16 = 24;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
@@ -66,9 +64,28 @@ impl Side {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Variant {
-    Branches,
+    Indent,
+    Tree,
     Blocks,
-    Map,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GroupBy {
+    Cwd,
+    Git,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DirDisplay {
+    Smart,
+    Short,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DirSort {
+    Window,
+    Alpha,
+    Active,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -109,6 +126,9 @@ pub struct Config {
     /// The user's keys for split-window -h and -v, read with list-keys.
     pub split_h_key: String,
     pub split_v_key: String,
+    pub group_by: GroupBy,
+    pub dir_display: DirDisplay,
+    pub dir_sort: DirSort,
 }
 
 impl Default for Config {
@@ -119,7 +139,7 @@ impl Default for Config {
             width: DEFAULT_WIDTH,
             default_width: DEFAULT_WIDTH,
             position: Side::Left,
-            style: Variant::Branches,
+            style: Variant::Indent,
             label_styles: true,
             theme: Theme::Auto,
             lang: Lang::Zh,
@@ -133,11 +153,14 @@ impl Default for Config {
             buttons: true,
             split_h_key: String::new(),
             split_v_key: String::new(),
+            group_by: GroupBy::Cwd,
+            dir_display: DirDisplay::Smart,
+            dir_sort: DirSort::Window,
         }
     }
 }
 
-const KEYS: [&str; 19] = [
+const KEYS: [&str; 22] = [
     "@arbor-mode",
     "@arbor-last-mode",
     "@arbor-width",
@@ -157,6 +180,9 @@ const KEYS: [&str; 19] = [
     "@arbor-buttons",
     "@arbor-split-h-key",
     "@arbor-split-v-key",
+    "@arbor-group-by",
+    "@arbor-dir-display",
+    "@arbor-dir-sort",
 ];
 
 fn flag(s: &str, default: bool) -> bool {
@@ -189,9 +215,9 @@ impl Config {
             default_width: crate::config::width(get(3)).unwrap_or(DEFAULT_WIDTH),
             position: if get(4) == "right" { Side::Right } else { Side::Left },
             style: match get(5) {
+                "tree" => Variant::Tree,
                 "blocks" => Variant::Blocks,
-                "map" => Variant::Map,
-                _ => Variant::Branches,
+                _ => Variant::Indent,
             },
             label_styles: flag(get(6), true),
             theme: match get(7) {
@@ -210,6 +236,13 @@ impl Config {
             buttons: flag(get(16), true),
             split_h_key: get(17).to_string(),
             split_v_key: get(18).to_string(),
+            group_by: if get(19) == "git" { GroupBy::Git } else { GroupBy::Cwd },
+            dir_display: if get(20) == "short" { DirDisplay::Short } else { DirDisplay::Smart },
+            dir_sort: match get(21) {
+                "alpha" => DirSort::Alpha,
+                "active" => DirSort::Active,
+                _ => DirSort::Window,
+            },
         }
     }
 
@@ -243,21 +276,51 @@ mod tests {
     #[test]
     fn parses_and_clamps() {
         let s = SEP.to_string();
-        let line =
-            ["rail", "hidden", "90", "", "right", "map", "off", "dark", "en", "0", "", "", "", "", "/bin/arbor", "C-a"]
-                .join(&s);
+        let line = [
+            "rail",
+            "hidden",
+            "90",
+            "",
+            "right",
+            "tree",
+            "off",
+            "dark",
+            "en",
+            "0",
+            "",
+            "",
+            "",
+            "",
+            "/bin/arbor",
+            "C-a",
+            "",
+            "",
+            "",
+            "git",
+            "short",
+            "active",
+        ]
+        .join(&s);
         let c = Config::parse(&line);
         assert_eq!(c.mode, Mode::Rail);
         assert_eq!(c.last_mode, Mode::Full);
         assert_eq!(c.width, MAX_W);
         assert_eq!(c.default_width, DEFAULT_WIDTH);
         assert_eq!(c.position, Side::Right);
-        assert_eq!(c.style, Variant::Map);
+        assert_eq!(c.style, Variant::Tree);
         assert!(!c.label_styles);
         assert_eq!(c.lang, Lang::En);
         assert_eq!(c.interval, 0);
         assert_eq!(c.cols(), RAIL);
         assert_eq!(c.prefix, "C-a");
+        assert_eq!(c.group_by, GroupBy::Git);
+        assert_eq!(c.dir_display, DirDisplay::Short);
+        assert_eq!(c.dir_sort, DirSort::Active);
+
+        let b = Config::parse(["", "", "", "", "", "blocks"].join(&s).as_str());
+        assert_eq!(b.style, Variant::Blocks);
+        let i = Config::parse(["", "", "", "", "", "branches"].join(&s).as_str());
+        assert_eq!(i.style, Variant::Indent);
     }
 
     #[test]

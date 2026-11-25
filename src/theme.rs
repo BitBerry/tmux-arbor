@@ -32,6 +32,8 @@ pub struct Palette {
     pub border_cur: Color,
     pub dot: Color,
     pub dot_active: Color,
+    pub dir_bg: Color,
+    pub dir_fg: Color,
 }
 
 const fn rgb(hex: u32) -> Color {
@@ -84,6 +86,8 @@ pub fn light() -> Palette {
         border_cur: A600,
         dot: N500,
         dot_active: A600,
+        dir_bg: rgb(0xe8eef4),
+        dir_fg: A700,
     }
 }
 
@@ -115,6 +119,8 @@ pub fn dark() -> Palette {
         border_cur: A500,
         dot: N600,
         dot_active: A500,
+        dir_bg: rgb(0x252c37),
+        dir_fg: A300,
     }
 }
 

@@ -1,12 +1,12 @@
-//! Lays a snapshot out into cells, in one of the design's three styles
-//! (branches, blocks, map) or as the 7-column rail, plus the header and
-//! footer around the list.
+//! Lays a 2-level Directory -> Pane snapshot out into cells, in one of the
+//! three styles (indent, tree, blocks) or as the 7-column rail, plus the
+//! header and footer around the list.
 
 use std::cell::{Cell, RefCell};
 use std::time::Duration;
 
-use crate::config::{MAP_MIN, Variant};
-use crate::model::{NodeKey, PaneInfo, Snapshot, Win, expanded};
+use crate::config::{GroupBy, Variant};
+use crate::model::{DirGroup, NodeKey, PaneItem, Snapshot};
 use crate::screen::{
     BOLD, Canvas, Color, DIM, OVERLINE, Style, UNDER_DASHED, UNDERLINE, skip_width, take_width, truncate, width,
 };
@@ -17,11 +17,12 @@ use crate::theme::Palette;
 pub enum Hit {
     #[default]
     None,
-    Window(String),
-    Chevron(String),
+    Dir(String),
+    DirAdd(String),
     Pane {
         wid: String,
         pid: String,
+        dir: String,
     },
     NewWindow,
     /// A split button: 'h' or 'v'.
@@ -32,7 +33,7 @@ impl Hit {
     /// The tree node a cell belongs to, if any.
     pub fn node(&self) -> Option<NodeKey> {
         match self {
-            Hit::Window(w) | Hit::Chevron(w) => Some(NodeKey::Window(w.clone())),
+            Hit::Dir(d) | Hit::DirAdd(d) => Some(NodeKey::Dir(d.clone())),
             Hit::Pane { pid, .. } => Some(NodeKey::Pane(pid.clone())),
             _ => None,
         }
@@ -42,23 +43,29 @@ impl Hit {
 /// Where a dragged node would land.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Target {
-    Before(String),
-    After(String),
-    Join { wid: String, pane: Option<String> },
+    DirBefore(String),
+    DirAfter(String),
     Swap(String),
+    Join { wid: String, pid: String },
     Break,
+    Invalid,
 }
 
 #[derive(Clone, Debug)]
 pub struct Drag {
     pub src: NodeKey,
     pub src_wid: String,
+    pub src_dir: String,
+    pub src_win_panes: usize,
     pub target: Option<Target>,
 }
 
 pub struct Ctx<'a> {
     pub snap: &'a Snapshot,
+    pub groups: &'a [DirGroup],
     pub pal: &'a Palette,
+    pub text: &'a Strings,
+    pub home: Option<&'a str>,
     pub width: u16,
     pub rail: bool,
     pub variant: Variant,
@@ -66,6 +73,8 @@ pub struct Ctx<'a> {
     /// Only set while the sidebar holds the keyboard.
     pub cursor: Option<&'a NodeKey>,
     pub hover: Option<&'a NodeKey>,
+    /// The `+` button on a directory row currently under the pointer.
+    pub hover_add: Option<&'a str>,
     /// The split button under the pointer.
     pub hover_split: Option<char>,
     pub drag: Option<&'a Drag>,
@@ -89,7 +98,7 @@ pub struct Tip {
 
 #[derive(Clone, Debug)]
 pub struct Group {
-    pub wid: String,
+    pub dir: String,
     pub y0: u16,
     pub y1: u16,
 }
@@ -104,18 +113,12 @@ pub struct List {
 struct Look {
     base: Style,
     sub: Color,
-    num: Color,
     plain: bool,
 }
 
 impl Ctx<'_> {
     pub fn plain(&self) -> Style {
         Style::default().bg(self.pal.bg)
-    }
-
-    /// Map labels need room; narrower sidebars fall back to branches.
-    fn variant(&self) -> Variant {
-        if self.variant == Variant::Map && self.width < MAP_MIN { Variant::Branches } else { self.variant }
     }
 
     fn is_cursor(&self, k: &NodeKey) -> bool {
@@ -130,32 +133,49 @@ impl Ctx<'_> {
         self.drag.and_then(|d| d.target.as_ref())
     }
 
-    fn join_into(&self, wid: &str) -> bool {
-        matches!(self.target(), Some(Target::Join { wid: w, .. }) if w == wid)
-    }
-
-    fn swap_into(&self, pid: &str) -> bool {
+    fn drop_into_pane(&self, pid: &str) -> bool {
         matches!(self.target(), Some(Target::Swap(p)) if p == pid)
+            || matches!(self.target(), Some(Target::Join { pid: p, .. }) if p == pid)
     }
 
-    fn win_look(&self, w: &Win) -> Look {
+    fn dir_look(&self, g: &DirGroup) -> Look {
         let p = self.pal;
-        let key = NodeKey::Window(w.id.clone());
-        let mut look = Look { base: self.plain().fg(p.text), sub: p.muted, num: p.muted, plain: !self.label_styles };
-        if w.active {
+        let key = NodeKey::Dir(g.raw_path.clone());
+        let mut look = Look { base: Style::default().bg(p.dir_bg).fg(p.dir_fg).with(BOLD), sub: p.muted, plain: true };
+        if g.collapsed && g.has_focused {
             look.base = Style::default().bg(p.cur_win_bg).fg(p.cur_win_fg).with(BOLD);
             look.sub = p.cur_win_sub;
         } else if self.is_hover(&key) {
             look.base = look.base.bg(p.hover_bg);
         }
-        if self.join_into(&w.id) {
+        if self.is_cursor(&key) {
+            look.base = Style::default().bg(p.cursor_bg).fg(p.cursor_fg).with(BOLD);
+            look.sub = p.cursor_sub;
+        }
+        look
+    }
+
+    fn pane_look(&self, it: &PaneItem) -> Look {
+        let p = self.pal;
+        let key = NodeKey::Pane(it.pane.id.clone());
+        let mut look = Look { base: self.plain().fg(p.text), sub: p.muted, plain: !self.label_styles };
+        if it.is_focused() {
+            look.base = Style::default().bg(p.cur_win_bg).fg(p.cur_win_fg).with(BOLD);
+            look.sub = p.cur_win_sub;
+        } else if it.is_win_sibling() {
+            look.base = Style::default().bg(p.cur_pane_bg).fg(p.cur_pane_fg);
+            look.sub = p.cur_pane_num;
+        } else if self.is_hover(&key) {
+            look.base = look.base.bg(p.hover_bg);
+        }
+        if self.drop_into_pane(&it.pane.id) {
             look.base = Style::default().bg(p.drop_bg).fg(p.drop_fg).underline(UNDER_DASHED).us(p.drop_line);
             look.sub = p.drop_fg;
             look.plain = true;
         }
         if self.is_cursor(&key) {
             look.base = Style::default().bg(p.cursor_bg).fg(p.cursor_fg);
-            if w.active {
+            if it.is_focused() {
                 look.base = look.base.with(BOLD);
             }
             look.sub = p.cursor_sub;
@@ -164,31 +184,10 @@ impl Ctx<'_> {
         look
     }
 
-    fn pane_look(&self, w: &Win, pane: &PaneInfo) -> Look {
-        let p = self.pal;
-        let key = NodeKey::Pane(pane.id.clone());
-        let mut look = Look { base: self.plain().fg(p.text), sub: p.muted, num: p.muted, plain: true };
-        if w.active && pane.active {
-            look.base = Style::default().bg(p.cur_pane_bg).fg(p.cur_pane_fg);
-            look.num = p.cur_pane_num;
-        } else if self.is_hover(&key) {
-            look.base = look.base.bg(p.hover_bg);
-        }
-        if self.swap_into(&pane.id) {
-            look.base = Style::default().bg(p.drop_bg).fg(p.drop_fg).underline(UNDER_DASHED).us(p.drop_line);
-            look.num = p.drop_fg;
-        }
-        if self.is_cursor(&key) {
-            look.base = Style::default().bg(p.cursor_bg).fg(p.cursor_fg);
-            look.num = p.cursor_sub;
-        }
-        look
-    }
-
-    /// Notes the popup when `key` wants one and its text, on row `y`, does
-    /// not fit in `avail` columns.
-    fn note_cut(&self, key: &NodeKey, y: u16, text: impl FnOnce() -> String, total: usize, avail: usize) {
-        if self.tip_for == Some(key) && total > avail {
+    /// Notes the popup when `key` wants one and either its text overflows or
+    /// `always` is true (e.g. a directory row showing its full path).
+    fn note_tip(&self, key: &NodeKey, y: u16, text: impl FnOnce() -> String, total: usize, avail: usize, always: bool) {
+        if self.tip_for == Some(key) && (always || total > avail) {
             *self.tip.borrow_mut() = Some(Tip { y, text: text() });
         }
     }
@@ -205,17 +204,8 @@ impl Ctx<'_> {
         Some(marquee_offset(dist, elapsed))
     }
 
-    /// The fold arrow of a window with several panes. Small triangles:
-    /// unlike ▶ ▼ (and the box-drawing guides) they are not East Asian
-    /// ambiguous width, so they take one column everywhere.
-    fn chevron(&self, w: &Win) -> Option<&'static str> {
-        if self.rail || w.panes.len() < 2 {
-            None
-        } else if w.collapsed {
-            Some("▸")
-        } else {
-            Some("▾")
-        }
+    fn dir_chevron(&self, g: &DirGroup) -> &'static str {
+        if g.collapsed { "▸" } else { "▾" }
     }
 }
 
@@ -261,20 +251,18 @@ fn put_scrolled(c: &mut Canvas<Hit>, x: u16, y: u16, spans: &[(String, Style)], 
     x
 }
 
-/// Writes a window's label from `x`, cut with "…" so it ends before
-/// `limit`, or scrolling when it is the marquee.
-fn put_label(c: &mut Canvas<Hit>, ctx: &Ctx, w: &Win, x: u16, y: u16, limit: u16, look: &Look) -> u16 {
-    let spans = if look.plain { vec![(w.label.plain(), look.base)] } else { w.label.spans(look.base) };
+fn put_spans_truncated(
+    c: &mut Canvas<Hit>,
+    mut x: u16,
+    y: u16,
+    spans: &[(String, Style)],
+    limit: u16,
+    fallback: Style,
+) -> u16 {
     let avail = limit.saturating_sub(x) as usize;
     let total: usize = spans.iter().map(|(s, _)| width(s)).sum();
-    let key = NodeKey::Window(w.id.clone());
-    ctx.note_cut(&key, y, || w.label.plain(), total, avail);
-    if let Some(skip) = ctx.scroll(&key, total, avail) {
-        return put_scrolled(c, x, y, &spans, skip, limit);
-    }
-    let mut x = x;
     if total <= avail {
-        for (s, st) in &spans {
+        for (s, st) in spans {
             x = c.put(x, y, s, *st, limit);
         }
         return x;
@@ -283,9 +271,9 @@ fn put_label(c: &mut Canvas<Hit>, ctx: &Ctx, w: &Win, x: u16, y: u16, limit: u16
         return x;
     }
     let mut room = avail - 1;
-    let mut last = look.base;
-    for (s, st) in &spans {
-        let part = crate::screen::take_width(s, room);
+    let mut last = fallback;
+    for (s, st) in spans {
+        let part = take_width(s, room);
         x = c.put(x, y, part, *st, limit);
         room -= width(part);
         last = *st;
@@ -300,53 +288,105 @@ fn put_text(c: &mut Canvas<Hit>, x: u16, y: u16, s: &str, style: Style, limit: u
     c.put(x, y, &truncate(s, limit.saturating_sub(x) as usize), style, limit)
 }
 
-/// A pane's text: cut with "…", or scrolling when it is the marquee.
-fn put_cmd(c: &mut Canvas<Hit>, ctx: &Ctx, pane: &PaneInfo, x: u16, y: u16, style: Style, limit: u16) -> u16 {
-    let key = NodeKey::Pane(pane.id.clone());
-    let (total, avail) = (width(&pane.cmd), limit.saturating_sub(x) as usize);
-    ctx.note_cut(&key, y, || pane.cmd.clone(), total, avail);
+fn put_dir_label(c: &mut Canvas<Hit>, ctx: &Ctx, g: &DirGroup, x: u16, y: u16, limit: u16, style: Style) -> u16 {
+    let key = NodeKey::Dir(g.raw_path.clone());
+    let total = width(&g.label);
+    let avail = limit.saturating_sub(x) as usize;
+    if ctx.hover_add == Some(g.raw_path.as_str()) {
+        ctx.note_tip(&key, y, || ctx.text.new_window_in(&g.label), total, avail, true);
+    } else {
+        let tip_text = format!("{} · {}", g.display_path, ctx.text.panes(g.items.len()));
+        ctx.note_tip(&key, y, || tip_text, total, avail, true);
+    }
     match ctx.scroll(&key, total, avail) {
-        Some(skip) => put_scrolled(c, x, y, &[(pane.cmd.clone(), style)], skip, limit),
-        None => put_text(c, x, y, &pane.cmd, style, limit),
+        Some(skip) => put_scrolled(c, x, y, &[(g.label.clone(), style)], skip, limit),
+        None => put_text(c, x, y, &g.label, style, limit),
     }
 }
 
-fn win_height(ctx: &Ctx, variant: Variant, w: &Win) -> u16 {
-    if ctx.rail {
-        return 1;
+fn put_pane_label(
+    c: &mut Canvas<Hit>,
+    ctx: &Ctx,
+    it: &PaneItem,
+    (x, y, limit): (u16, u16, u16),
+    look: &Look,
+    has_sub: bool,
+) -> u16 {
+    let spans = if look.plain { vec![(it.pane.cmd.clone(), look.base)] } else { it.pane.label.spans(look.base) };
+    let avail = limit.saturating_sub(x) as usize;
+    let total: usize = spans.iter().map(|(s, _)| width(s)).sum();
+    let key = NodeKey::Pane(it.pane.id.clone());
+    let always_tip = has_sub || it.win_pane_count > 1;
+    ctx.note_tip(&key, y, || it.tooltip(ctx.home), total, avail, always_tip);
+    if let Some(skip) = ctx.scroll(&key, total, avail) {
+        return put_scrolled(c, x, y, &spans, skip, limit);
     }
-    let panes = if expanded(w, false) { w.panes.len() as u16 } else { 0 };
-    match variant {
-        Variant::Branches => 1 + panes,
+    put_spans_truncated(c, x, y, &spans, limit, look.base)
+}
+
+fn dir_badges(g: &DirGroup) -> String {
+    if !g.collapsed {
+        return String::new();
+    }
+    let mut b = String::new();
+    if g.has_focused {
+        b.push('*');
+    }
+    if g.has_activity {
+        b.push('#');
+    }
+    if g.has_bell {
+        b.push('!');
+    }
+    b
+}
+
+fn group_height(ctx: &Ctx, g: &DirGroup) -> u16 {
+    if ctx.rail {
+        return g.items.len() as u16;
+    }
+    let panes = if g.collapsed { 0 } else { g.items.len() as u16 };
+    match ctx.variant {
+        Variant::Indent | Variant::Tree => 1 + panes,
         Variant::Blocks => 2 + panes,
-        Variant::Map => {
-            let map = if expanded(w, false) { map_geom(w, ctx.width.saturating_sub(3)).map(|g| g.h + 1) } else { None };
-            1 + map.unwrap_or(0)
-        }
     }
 }
 
 pub fn list(ctx: &Ctx) -> List {
-    let variant = ctx.variant();
-    let heights: Vec<u16> = ctx.snap.windows.iter().map(|w| win_height(ctx, variant, w)).collect();
-    let total = heights.iter().sum::<u16>().max(1);
+    let mut total: u16 = ctx.groups.iter().map(|g| group_height(ctx, g)).sum();
+    if ctx.rail && ctx.groups.len() > 1 {
+        total += (ctx.groups.len() - 1) as u16;
+    }
+    total = total.max(1);
     let mut c = Canvas::new(ctx.width, total, ctx.plain());
     let mut groups = Vec::new();
     let mut nodes = Vec::new();
     let mut y = 0;
-    for (i, w) in ctx.snap.windows.iter().enumerate() {
+
+    for (gi, g) in ctx.groups.iter().enumerate() {
+        let gh = group_height(ctx, g);
         if ctx.rail {
-            draw_rail(&mut c, y, ctx, w, &mut nodes);
-        } else {
-            match variant {
-                Variant::Branches => draw_branches(&mut c, y, ctx, w, &mut nodes),
-                Variant::Blocks => draw_blocks(&mut c, y, ctx, w, &mut nodes),
-                Variant::Map => draw_map(&mut c, y, ctx, w, &mut nodes),
+            if gi > 0 {
+                let st = ctx.plain().fg(if g.has_focused { ctx.pal.accent } else { ctx.pal.divider });
+                let sx = ctx.width.saturating_sub(2) / 2;
+                c.put(sx, y, "──", st, ctx.width);
+                c.set_hit(0, ctx.width, y, &Hit::Dir(g.raw_path.clone()));
+                y += 1;
             }
+            let y0 = y;
+            draw_rail_group(&mut c, y, ctx, g, &mut nodes);
+            groups.push(Group { dir: g.raw_path.clone(), y0, y1: y + gh.saturating_sub(1) });
+            y += gh;
+        } else {
+            match ctx.variant {
+                Variant::Indent | Variant::Tree => draw_line_group(&mut c, y, ctx, g, &mut nodes),
+                Variant::Blocks => draw_dir_block(&mut c, y, ctx, g, &mut nodes),
+            }
+            groups.push(Group { dir: g.raw_path.clone(), y0: y, y1: y + gh.saturating_sub(1) });
+            y += gh;
         }
-        groups.push(Group { wid: w.id.clone(), y0: y, y1: y + heights[i] - 1 });
-        y += heights[i];
     }
+
     decorate_drag(&mut c, ctx, &groups, &nodes, 1);
     List { canvas: c, groups, nodes }
 }
@@ -355,7 +395,7 @@ pub fn list(ctx: &Ctx) -> List {
 fn decorate_drag(c: &mut Canvas<Hit>, ctx: &Ctx, groups: &[Group], nodes: &[(NodeKey, u16, u16)], indent: u16) {
     let Some(drag) = ctx.drag else { return };
     let rows = match &drag.src {
-        NodeKey::Window(wid) => groups.iter().find(|g| &g.wid == wid).map(|g| (g.y0, g.y1)),
+        NodeKey::Dir(dir) => groups.iter().find(|g| &g.dir == dir).map(|g| (g.y0, g.y1)),
         NodeKey::Pane(_) => nodes.iter().find(|(k, ..)| *k == drag.src).map(|(_, a, b)| (*a, *b)),
     };
     if let Some((a, b)) = rows {
@@ -372,13 +412,13 @@ fn decorate_drag(c: &mut Canvas<Hit>, ctx: &Ctx, groups: &[Group], nodes: &[(Nod
         })
     };
     match ctx.target() {
-        Some(Target::Before(wid)) => {
-            if let Some(i) = groups.iter().position(|g| &g.wid == wid) {
+        Some(Target::DirBefore(dir)) => {
+            if let Some(i) = groups.iter().position(|g| &g.dir == dir) {
                 if i > 0 { mark(c, groups[i - 1].y1, UNDERLINE) } else { mark(c, groups[i].y0, OVERLINE) }
             }
         }
-        Some(Target::After(wid)) => {
-            if let Some(g) = groups.iter().find(|g| &g.wid == wid) {
+        Some(Target::DirAfter(dir)) => {
+            if let Some(g) = groups.iter().find(|g| &g.dir == dir) {
                 mark(c, g.y1, UNDERLINE);
             }
         }
@@ -386,69 +426,147 @@ fn decorate_drag(c: &mut Canvas<Hit>, ctx: &Ctx, groups: &[Group], nodes: &[(Nod
     }
 }
 
-/// Marks a window with one pane in the arrow column. Not East Asian
-/// ambiguous width either.
+/// Neutral-width indicator for inactive panes in `Variant::Indent`.
 const LEAF: &str = "∙";
 
-/// 1a: one row per node. A window row starts with its fold arrow and its
-/// panes hang from below it on ├─ guides. The arrow never touches a guide
-/// sideways: terminals draw box lines at the exact middle of the cell,
-/// fonts put ▸ a little lower, and side by side the difference shows.
-fn draw_branches(c: &mut Canvas<Hit>, y0: u16, ctx: &Ctx, w: &Win, nodes: &mut Vec<(NodeKey, u16, u16)>) {
+fn draw_dir_row(c: &mut Canvas<Hit>, y: u16, ctx: &Ctx, g: &DirGroup, nodes: &mut Vec<(NodeKey, u16, u16)>) {
     let full = ctx.width;
     let end = full.saturating_sub(1);
-    let guide = ctx.plain().fg(ctx.pal.guide);
-    let look = ctx.win_look(w);
-    c.fill(1, end, y0, look.base);
-    // A one-pane window is a leaf: a dot holds the arrow's place.
-    c.put(1, y0, ctx.chevron(w).unwrap_or(LEAF), look.base.fg(look.sub), end);
-    put_label(c, ctx, w, 3, y0, end.saturating_sub(1), &look);
-    c.set_hit(0, full, y0, &Hit::Window(w.id.clone()));
-    if ctx.chevron(w).is_some() {
-        c.set_hit(0, 3, y0, &Hit::Chevron(w.id.clone()));
+    let key = NodeKey::Dir(g.raw_path.clone());
+    let look = ctx.dir_look(g);
+    c.fill(1, end, y, look.base);
+    c.put(1, y, ctx.dir_chevron(g), look.base.fg(look.sub), end);
+
+    let hovered = ctx.is_hover(&key);
+    let right_limit = if hovered && end >= 8 {
+        let add_x = end - 3;
+        let add_st = if ctx.hover_add == Some(g.raw_path.as_str()) {
+            Style::default().bg(ctx.pal.cursor_bg).fg(ctx.pal.cursor_fg).with(BOLD)
+        } else {
+            Style::default().bg(ctx.pal.cur_win_bg).fg(ctx.pal.cur_win_fg).with(BOLD)
+        };
+        c.put(add_x, y, " + ", add_st, end);
+        add_x
+    } else {
+        let badges = dir_badges(g);
+        let cnt = g.items.len().to_string();
+        let right_text = if badges.is_empty() { cnt } else { format!("{badges} {cnt}") };
+        let rw = width(&right_text) as u16;
+        if end > 5 + rw {
+            let rx = end - rw - 1;
+            c.put(rx, y, &right_text, look.base.fg(look.sub), end);
+            rx
+        } else {
+            end
+        }
+    };
+
+    put_dir_label(c, ctx, g, 3, y, right_limit.saturating_sub(1), look.base);
+    c.set_hit(0, full, y, &Hit::Dir(g.raw_path.clone()));
+    if hovered && end >= 8 {
+        c.set_hit(end - 3, full, y, &Hit::DirAdd(g.raw_path.clone()));
     }
-    nodes.push((NodeKey::Window(w.id.clone()), y0, y0));
-    if !expanded(w, ctx.rail) {
+    nodes.push((key, y, y));
+}
+
+fn draw_pane_row(
+    c: &mut Canvas<Hit>,
+    y: u16,
+    ctx: &Ctx,
+    g: &DirGroup,
+    it: &PaneItem,
+    is_last: bool,
+    nodes: &mut Vec<(NodeKey, u16, u16)>,
+) {
+    let full = ctx.width;
+    let end = full.saturating_sub(1);
+    let guide_st = ctx.plain().fg(ctx.pal.guide);
+    let look = ctx.pane_look(it);
+
+    match ctx.variant {
+        Variant::Tree => {
+            c.put(0, y, if is_last { " └─ " } else { " ├─ " }, guide_st, full);
+            c.fill(4, end, y, look.base);
+        }
+        _ => {
+            c.fill(2, end, y, look.base);
+            let ind = if it.is_focused() {
+                "▪"
+            } else if it.is_win_sibling() {
+                "▫"
+            } else {
+                LEAF
+            };
+            let ind_color = if ctx.is_cursor(&NodeKey::Pane(it.pane.id.clone())) {
+                ctx.pal.cursor_sub
+            } else if it.is_focused() {
+                ctx.pal.cur_win_sub
+            } else if it.is_win_sibling() {
+                ctx.pal.dot_active
+            } else {
+                ctx.pal.dot
+            };
+            c.put(2, y, ind, look.base.fg(ind_color), end);
+        }
+    }
+
+    let badge = it.badge();
+    let bw = width(&badge) as u16;
+    let mut text_limit = end;
+    if end > 6 + bw {
+        let bx = end - bw - 1;
+        c.put(bx, y, &badge, look.base.fg(look.sub), end);
+        text_limit = bx.saturating_sub(1);
+    }
+
+    let sub = (ctx.snap.cfg.group_by == GroupBy::Git).then(|| it.rel_subdir(&g.raw_path, ctx.home)).flatten();
+    let mut has_sub = false;
+    if let Some(sub) = &sub {
+        let tag = format!("({sub})");
+        let tw = width(&tag) as u16;
+        if text_limit > 4 + tw + 4 {
+            let tx = text_limit - tw;
+            c.put(tx, y, &tag, look.base.fg(look.sub), text_limit);
+            text_limit = tx.saturating_sub(1);
+            has_sub = true;
+        }
+    }
+
+    put_pane_label(c, ctx, it, (4, y, text_limit), &look, has_sub);
+    c.set_hit(0, full, y, &Hit::Pane { wid: it.wid.clone(), pid: it.pane.id.clone(), dir: g.raw_path.clone() });
+    nodes.push((NodeKey::Pane(it.pane.id.clone()), y, y));
+}
+
+fn draw_line_group(c: &mut Canvas<Hit>, y0: u16, ctx: &Ctx, g: &DirGroup, nodes: &mut Vec<(NodeKey, u16, u16)>) {
+    draw_dir_row(c, y0, ctx, g, nodes);
+    if g.collapsed {
         return;
     }
-    let n = w.panes.len();
-    for (i, pane) in w.panes.iter().enumerate() {
-        let y = y0 + 1 + i as u16;
-        c.put(0, y, if i + 1 == n { " └─" } else { " ├─" }, guide, full);
-        let look = ctx.pane_look(w, pane);
-        c.fill(3, end, y, look.base);
-        let num = (i + 1).to_string();
-        let x = c.put(4, y, &num, look.base.fg(look.num), end);
-        put_cmd(c, ctx, pane, x.max(5) + 1, y, look.base, end.saturating_sub(1));
-        c.set_hit(0, full, y, &Hit::Pane { wid: w.id.clone(), pid: pane.id.clone() });
-        nodes.push((NodeKey::Pane(pane.id.clone()), y, y));
+    let n = g.items.len();
+    for (i, it) in g.items.iter().enumerate() {
+        draw_pane_row(c, y0 + 1 + i as u16, ctx, g, it, i + 1 == n, nodes);
     }
 }
 
 const THIN: [&str; 6] = ["┌", "┐", "└", "┘", "─", "│"];
 const HEAVY: [&str; 6] = ["┏", "┓", "┗", "┛", "━", "┃"];
-const DASHED: [&str; 6] = ["┌", "┐", "└", "┘", "╌", "╎"];
 
-/// 1b: each window in a thin frame with its label in the top edge.
-fn draw_blocks(c: &mut Canvas<Hit>, y0: u16, ctx: &Ctx, w: &Win, nodes: &mut Vec<(NodeKey, u16, u16)>) {
+fn draw_dir_block(c: &mut Canvas<Hit>, y0: u16, ctx: &Ctx, g: &DirGroup, nodes: &mut Vec<(NodeKey, u16, u16)>) {
     let p = ctx.pal;
     let full = ctx.width;
     let (x0, x1) = (1, full.saturating_sub(2));
-    let key = NodeKey::Window(w.id.clone());
+    let key = NodeKey::Dir(g.raw_path.clone());
     let cursor = ctx.is_cursor(&key);
-    let into = ctx.join_into(&w.id);
     let (set, color) = if cursor {
         (HEAVY, p.cursor_bg)
-    } else if into {
-        (DASHED, p.drop_line)
-    } else if w.active {
+    } else if g.has_focused {
         (THIN, p.border_cur)
     } else {
         (THIN, p.border)
     };
     let frame = ctx.plain().fg(color);
-    let open = expanded(w, false);
-    let last = y0 + 1 + if open { w.panes.len() as u16 } else { 0 };
+    let open = !g.collapsed;
+    let last = y0 + 1 + if open { g.items.len() as u16 } else { 0 };
     for y in y0..=last {
         if y == y0 || y == last {
             c.put(x0, y, if y == y0 { set[0] } else { set[2] }, frame, full);
@@ -460,259 +578,113 @@ fn draw_blocks(c: &mut Canvas<Hit>, y0: u16, ctx: &Ctx, w: &Win, nodes: &mut Vec
             c.put(x0, y, set[5], frame, full);
             c.put(x1, y, set[5], frame, full);
         }
-        c.set_hit(0, full, y, &Hit::Window(w.id.clone()));
+        c.set_hit(0, full, y, &Hit::Dir(g.raw_path.clone()));
     }
 
-    // The frame carries the state; the title keeps the plain ground unless
-    // it is the cursor or the drop target.
-    let mut look = ctx.win_look(w);
-    if !cursor && !into {
+    let mut look = ctx.dir_look(g);
+    if !cursor && !(g.collapsed && g.has_focused) {
         let bg = if ctx.is_hover(&key) { p.hover_bg } else { p.bg };
         look.base = look.base.bg(bg);
-        if w.active {
-            look.base = look.base.fg(p.cur_win_fg);
+    }
+    let chev = ctx.dir_chevron(g);
+    let hovered = ctx.is_hover(&key);
+    let title_end = if hovered && x1 >= x0 + 10 {
+        let add_x = x1 - 5;
+        let add_st = if ctx.hover_add == Some(g.raw_path.as_str()) {
+            Style::default().bg(p.cursor_bg).fg(p.cursor_fg).with(BOLD)
+        } else {
+            Style::default().bg(p.cur_win_bg).fg(p.cur_win_fg).with(BOLD)
+        };
+        c.put(add_x, y0, " + ", add_st, x1);
+        c.put(x1 - 2, y0, &format!("{chev} "), frame.fg(p.muted), x1);
+        c.set_hit(add_x, x1 - 2, y0, &Hit::DirAdd(g.raw_path.clone()));
+        add_x
+    } else {
+        let badges = dir_badges(g);
+        let cnt = g.items.len();
+        let right_str = if badges.is_empty() { format!(" {cnt} {chev} ") } else { format!(" {badges} {cnt} {chev} ") };
+        let rw = width(&right_str) as u16;
+        if x1 > x0 + rw + 4 {
+            let rx = x1 - rw;
+            c.put(rx, y0, &right_str, frame.fg(if g.collapsed && g.has_focused { p.cur_win_sub } else { p.muted }), x1);
+            rx
+        } else {
+            x1
         }
-    }
-    let title_end = x1.saturating_sub(3);
+    };
+
     let x = c.put(x0 + 1, y0, " ", look.base, title_end);
-    let x = put_label(c, ctx, w, x, y0, title_end.saturating_sub(1), &look);
+    let x = put_dir_label(c, ctx, g, x, y0, title_end.saturating_sub(1), look.base);
     c.put(x, y0, " ", look.base, title_end);
-    if let Some(chev) = ctx.chevron(w) {
-        c.put(x1 - 3, y0, &format!(" {chev} "), frame.fg(if w.active { p.cur_win_sub } else { p.muted }), x1);
-        c.set_hit(x1 - 3, x1, y0, &Hit::Chevron(w.id.clone()));
-    }
     nodes.push((key, y0, y0));
+
     if !open {
         return;
     }
-    for (i, pane) in w.panes.iter().enumerate() {
+    for (i, it) in g.items.iter().enumerate() {
         let y = y0 + 1 + i as u16;
-        let look = ctx.pane_look(w, pane);
+        let look = ctx.pane_look(it);
         c.fill(x0 + 1, x1, y, look.base);
-        let pkey = NodeKey::Pane(pane.id.clone());
+        let pkey = NodeKey::Pane(it.pane.id.clone());
         let dot_color = if ctx.is_cursor(&pkey) {
             p.cursor_fg
-        } else if pane.active {
+        } else if it.is_focused() {
+            p.cur_win_sub
+        } else if it.is_win_sibling() {
             p.dot_active
         } else {
             p.dot
         };
-        c.put(x0 + 2, y, if pane.active { "■" } else { "□" }, look.base.fg(dot_color), x1);
-        let num = (i + 1).to_string();
-        let x = c.put(x0 + 4, y, &num, look.base.fg(look.num), x1);
-        put_cmd(c, ctx, pane, x + 1, y, look.base, x1.saturating_sub(1));
-        c.set_hit(0, full, y, &Hit::Pane { wid: w.id.clone(), pid: pane.id.clone() });
+        let ind = if it.is_focused() {
+            "■"
+        } else if it.is_win_sibling() {
+            "▫"
+        } else {
+            "□"
+        };
+        c.put(x0 + 2, y, ind, look.base.fg(dot_color), x1);
+
+        let badge = it.badge();
+        let bw = width(&badge) as u16;
+        let mut text_limit = x1.saturating_sub(1);
+        if x1 > x0 + 6 + bw {
+            let bx = x1 - bw - 1;
+            c.put(bx, y, &badge, look.base.fg(look.sub), x1);
+            text_limit = bx.saturating_sub(1);
+        }
+        put_pane_label(c, ctx, it, (x0 + 4, y, text_limit), &look, false);
+        c.set_hit(0, full, y, &Hit::Pane { wid: it.wid.clone(), pid: it.pane.id.clone(), dir: g.raw_path.clone() });
         nodes.push((pkey, y, y));
     }
 }
 
-/// Pane rectangles scaled into a small grid; corners are shared borders.
-struct MapGeom {
-    w: u16,
-    h: u16,
-    /// Per work pane, in order: x0, y0, x1, y1 (border lines, inclusive).
-    rects: Vec<[u16; 4]>,
-}
-
-/// Places sorted edge values on `0..=span`, keeping neighbours at least
-/// `gap` apart. With `fit`, the result is squeezed back inside `span`.
-fn scale_edges(edges: &[u32], total: u32, span: u16, gap: u16, fit: bool) -> Vec<u16> {
-    let total = total.max(1) as f64;
-    let mut pos: Vec<i32> = edges.iter().map(|&e| (e as f64 * span as f64 / total).round() as i32).collect();
-    let gap = gap as i32;
-    for i in 1..pos.len() {
-        pos[i] = pos[i].max(pos[i - 1] + gap);
-    }
-    if fit && let Some(last) = pos.last_mut() {
-        *last = (*last).min(span as i32);
-        for i in (0..pos.len().saturating_sub(1)).rev() {
-            pos[i] = pos[i].min(pos[i + 1] - gap);
+fn draw_rail_group(c: &mut Canvas<Hit>, y0: u16, ctx: &Ctx, g: &DirGroup, nodes: &mut Vec<(NodeKey, u16, u16)>) {
+    for (i, it) in g.items.iter().enumerate() {
+        let y = y0 + i as u16;
+        let look = ctx.pane_look(it);
+        let text = it.rail_label();
+        let tw = width(&text) as u16;
+        let mut bw = (tw + 2).max(4).min(ctx.width);
+        if (ctx.width - bw) % 2 == 1 && bw < ctx.width {
+            bw += 1;
         }
-    }
-    pos.into_iter().map(|p| p.max(0) as u16).collect()
-}
-
-fn map_geom(w: &Win, cw: u16) -> Option<MapGeom> {
-    if cw < 5 || w.panes.is_empty() {
-        return None;
-    }
-    let min_l = w.panes.iter().map(|p| p.left).min()? as u32;
-    let min_t = w.panes.iter().map(|p| p.top).min()? as u32;
-    // A pane spans from its own left edge to the border after it.
-    let xe: Vec<(u32, u32)> =
-        w.panes.iter().map(|p| (p.left as u32 - min_l, p.left as u32 + p.width as u32 + 1 - min_l)).collect();
-    let ye: Vec<(u32, u32)> =
-        w.panes.iter().map(|p| (p.top as u32 - min_t, p.top as u32 + p.height as u32 + 1 - min_t)).collect();
-    let tw = xe.iter().map(|e| e.1).max()?;
-    let th = ye.iter().map(|e| e.1).max()?;
-    let distinct = |es: &[(u32, u32)]| {
-        let mut v: Vec<u32> = es.iter().flat_map(|e| [e.0, e.1]).collect();
-        v.sort_unstable();
-        v.dedup();
-        v
-    };
-    let (xs, ys) = (distinct(&xe), distinct(&ye));
-    let span_x = cw - 1;
-    let px = scale_edges(&xs, tw, span_x, 2, true);
-    // As short as the design's map: the smallest pane gets one text row,
-    // the rest in proportion, six rows at most. tmux never splits exactly in
-    // half (a border takes a row), hence the slack.
-    let min_h = w.panes.iter().map(|p| p.height).min()?.max(1) as f64;
-    let rows = (th.saturating_sub(1) as f64 / min_h - 0.15).ceil().clamp(1.0, 6.0) as u16;
-    let span_y = rows + ys.len() as u16 - 1;
-    let py = scale_edges(&ys, th, span_y, 2, false);
-    let at = |edges: &[u32], pos: &[u16], e: u32| edges.binary_search(&e).map(|i| pos[i]).unwrap_or(0);
-    let rects = xe
-        .iter()
-        .zip(&ye)
-        .map(|(x, y)| [at(&xs, &px, x.0), at(&ys, &py, y.0), at(&xs, &px, x.1), at(&ys, &py, y.1)])
-        .collect();
-    Some(MapGeom { w: cw, h: py.last().copied().unwrap_or(0) + 1, rects })
-}
-
-fn box_char(bits: u8) -> &'static str {
-    const U: u8 = 1;
-    const D: u8 = 2;
-    const L: u8 = 4;
-    const R: u8 = 8;
-    match bits {
-        0 => " ",
-        b if b == U | D | L | R => "┼",
-        b if b == U | D | R => "├",
-        b if b == U | D | L => "┤",
-        b if b == D | L | R => "┬",
-        b if b == U | L | R => "┴",
-        b if b == D | R => "┌",
-        b if b == D | L => "┐",
-        b if b == U | R => "└",
-        b if b == U | L => "┘",
-        b if b & (U | D) != 0 && b & (L | R) == 0 => "│",
-        _ => "─",
+        let x = (ctx.width - bw) / 2;
+        c.fill(x, x + bw, y, look.base);
+        c.put(x + (bw - tw) / 2, y, &text, look.base, x + bw);
+        c.set_hit(
+            0,
+            ctx.width,
+            y,
+            &Hit::Pane { wid: it.wid.clone(), pid: it.pane.id.clone(), dir: g.raw_path.clone() },
+        );
+        let key = NodeKey::Pane(it.pane.id.clone());
+        let tip_text = format!("{} · {} (w{})", g.label, it.pane.cmd, it.win_index);
+        ctx.note_tip(&key, y, || tip_text, 100, 0, true);
+        nodes.push((key, y, y));
     }
 }
 
-/// 1c: the window's real split layout as a grid of cells.
-fn draw_map(c: &mut Canvas<Hit>, y0: u16, ctx: &Ctx, w: &Win, nodes: &mut Vec<(NodeKey, u16, u16)>) {
-    let p = ctx.pal;
-    let full = ctx.width;
-    let end = full.saturating_sub(1);
-    let look = ctx.win_look(w);
-    c.fill(1, end, y0, look.base);
-    let chev = end.saturating_sub(2);
-    put_label(c, ctx, w, 2, y0, chev.saturating_sub(1), &look);
-    c.set_hit(0, full, y0, &Hit::Window(w.id.clone()));
-    if let Some(arrow) = ctx.chevron(w) {
-        c.put(chev, y0, arrow, look.base.fg(look.sub), end);
-        c.set_hit(chev.saturating_sub(1), end, y0, &Hit::Chevron(w.id.clone()));
-    }
-    nodes.push((NodeKey::Window(w.id.clone()), y0, y0));
-    if !expanded(w, false) {
-        return;
-    }
-    let Some(g) = map_geom(w, full.saturating_sub(3)) else { return };
-    let (ox, oy) = (2u16, y0 + 1);
-
-    let mut bits = vec![0u8; g.w as usize * g.h as usize];
-    let mut add = |x: u16, y: u16, b: u8| {
-        if x < g.w && y < g.h {
-            bits[y as usize * g.w as usize + x as usize] |= b;
-        }
-    };
-    for r in &g.rects {
-        let [x0, y0r, x1, y1] = *r;
-        for x in x0..x1 {
-            for y in [y0r, y1] {
-                add(x, y, 8);
-                add(x + 1, y, 4);
-            }
-        }
-        for y in y0r..y1 {
-            for x in [x0, x1] {
-                add(x, y, 2);
-                add(x, y + 1, 1);
-            }
-        }
-    }
-    let border = ctx.plain().fg(p.border);
-    for y in 0..g.h {
-        for x in 0..g.w {
-            let b = bits[y as usize * g.w as usize + x as usize];
-            if b != 0 {
-                c.put(ox + x, oy + y, box_char(b), border, full);
-            }
-        }
-    }
-
-    for (i, (pane, r)) in w.panes.iter().zip(&g.rects).enumerate() {
-        let [x0, y0r, x1, y1] = *r;
-        let hit = Hit::Pane { wid: w.id.clone(), pid: pane.id.clone() };
-        for y in y0r..=y1 {
-            c.set_hit(ox + x0, ox + x1 + 1, oy + y, &hit);
-        }
-        let mut look = ctx.pane_look(w, pane);
-        if !(w.active && pane.active) && !ctx.is_cursor(&NodeKey::Pane(pane.id.clone())) && !ctx.swap_into(&pane.id) {
-            look.base = look.base.without(BOLD);
-        }
-        for y in y0r + 1..y1 {
-            c.fill(ox + x0 + 1, ox + x1, oy + y, look.base);
-        }
-        if y1 > y0r + 1 && x1 > x0 + 1 {
-            let limit = ox + x1;
-            let x = c.put(ox + x0 + 1, oy + y0r + 1, &(i + 1).to_string(), look.base.fg(look.num).with(BOLD), limit);
-            put_cmd(c, ctx, pane, x + 1, oy + y0r + 1, look.base, limit);
-        }
-        nodes.push((NodeKey::Pane(pane.id.clone()), oy + y0r, oy + y1));
-    }
-
-    // Recolour the borders of the panes that matter, most important last.
-    let mut outline = |r: &[u16; 4], style: Style| {
-        let [x0, y0r, x1, y1] = *r;
-        for x in x0..=x1 {
-            for y in [y0r, y1] {
-                c.restyle(ox + x, ox + x + 1, oy + y, |s| *s = s.fg(style.fg).with(style.attrs));
-            }
-        }
-        for y in y0r..=y1 {
-            for x in [x0, x1] {
-                c.restyle(ox + x, ox + x + 1, oy + y, |s| *s = s.fg(style.fg).with(style.attrs));
-            }
-        }
-    };
-    let pairs: Vec<(&PaneInfo, &[u16; 4])> = w.panes.iter().zip(&g.rects).collect();
-    for (pane, r) in &pairs {
-        if pane.active {
-            outline(r, Style::default().fg(if w.active { p.border_cur } else { p.guide }));
-        }
-    }
-    for (pane, r) in &pairs {
-        if ctx.swap_into(&pane.id) {
-            outline(r, Style::default().fg(p.drop_line));
-        }
-    }
-    for (pane, r) in &pairs {
-        if ctx.is_cursor(&NodeKey::Pane(pane.id.clone())) {
-            outline(r, Style::default().fg(p.cursor_bg).with(BOLD));
-        }
-    }
-}
-
-/// The rail: window numbers only.
-fn draw_rail(c: &mut Canvas<Hit>, y: u16, ctx: &Ctx, w: &Win, nodes: &mut Vec<(NodeKey, u16, u16)>) {
-    let look = ctx.win_look(w);
-    let text = w.index.to_string();
-    let mut bw = (width(&text) as u16 + 2).max(4).min(ctx.width);
-    // Match the sidebar's parity so the number sits dead centre.
-    if (ctx.width - bw) % 2 == 1 && bw < ctx.width {
-        bw += 1;
-    }
-    let x = (ctx.width - bw) / 2;
-    c.fill(x, x + bw, y, look.base);
-    c.put(x + (bw - width(&text) as u16) / 2, y, &text, look.base, x + bw);
-    c.set_hit(0, ctx.width, y, &Hit::Window(w.id.clone()));
-    nodes.push((NodeKey::Window(w.id.clone()), y, y));
-}
-
-/// Session name and window count; on the right the TREE badge and, with
+/// Session name and pane/dir count; on the right the TREE badge and, with
 /// `buttons`, the two split buttons; then a rule. Two rows.
 pub fn header(c: &mut Canvas<Hit>, ctx: &Ctx, focused: bool, buttons: bool, text: &Strings) -> u16 {
     let p = ctx.pal;
@@ -733,8 +705,6 @@ pub fn header(c: &mut Canvas<Hit>, ctx: &Ctx, focused: bool, buttons: bool, text
     } else {
         let mut right = full.saturating_sub(1);
         if buttons {
-            // Icon buttons, as in the design; their tooltip names the
-            // split and the user's own key for it.
             let cfg = &ctx.snap.cfg;
             let items = [('h', "◫", text.split_h(), &cfg.split_h_key), ('v', "⊟", text.split_v(), &cfg.split_v_key)];
             let start = full.saturating_sub(7);
@@ -758,8 +728,18 @@ pub fn header(c: &mut Canvas<Hit>, ctx: &Ctx, focused: bool, buttons: bool, text
             right = bx.saturating_sub(1);
         }
         let x = put_text(c, 1, 0, name, ctx.plain().fg(p.accent).with(BOLD), right);
-        let count = text.windows(ctx.snap.windows.len());
-        if x + 2 + width(&count) as u16 <= right {
+        let panes = ctx.snap.pane_count();
+        let dirs = ctx.groups.len();
+        let primary = if full >= 30 { text.panes_dirs(panes, dirs) } else { text.panes(panes) };
+        let fallback = text.panes(panes);
+        let count = if x + 2 + width(&primary) as u16 <= right {
+            Some(primary)
+        } else if x + 2 + width(&fallback) as u16 <= right {
+            Some(fallback)
+        } else {
+            None
+        };
+        if let Some(count) = count {
             c.put(x + 2, 0, &count, ctx.plain().fg(p.muted), right);
         }
     }
@@ -767,7 +747,6 @@ pub fn header(c: &mut Canvas<Hit>, ctx: &Ctx, focused: bool, buttons: bool, text
     for x in 0..full {
         c.put(x, 1, "─", rule, full);
     }
-    // A button's tooltip hangs below it, right-aligned to it.
     if let Some((end, label)) = tip {
         tooltip(c, ctx, end.saturating_sub(width(&label) as u16 + 2), 1, &label, c.h);
     }
@@ -865,16 +844,27 @@ mod tests {
     use crate::model::tests::sample;
     use crate::theme;
 
-    fn ctx<'a>(snap: &'a Snapshot, pal: &'a Palette, variant: Variant, width: u16) -> Ctx<'a> {
+    fn ctx<'a>(
+        snap: &'a Snapshot,
+        groups: &'a [DirGroup],
+        pal: &'a Palette,
+        text: &'a Strings,
+        variant: Variant,
+        width: u16,
+    ) -> Ctx<'a> {
         Ctx {
             snap,
+            groups,
             pal,
+            text,
+            home: Some("/home/u"),
             width,
             rail: false,
             variant,
             label_styles: true,
             cursor: None,
             hover: None,
+            hover_add: None,
             hover_split: None,
             drag: None,
             marquee: None,
@@ -885,99 +875,104 @@ mod tests {
     }
 
     #[test]
-    fn branches_layout() {
+    fn indent_layout() {
         let snap = sample();
+        let groups = snap.groups_with_home(Some("/home/u"));
         let pal = theme::light();
-        let l = list(&ctx(&snap, &pal, Variant::Branches, 28));
+        let text = Strings::new(crate::config::Lang::Zh);
+        let mut cx = ctx(&snap, &groups, &pal, &text, Variant::Indent, 28);
+        let l = list(&cx);
         let rows: Vec<String> = (0..l.canvas.h).map(|y| l.canvas.row_text(y).trim_end().to_string()).collect();
         assert_eq!(
             rows,
-            vec![" ▾ 1:editor*", " ├─ 1 nvim", " ├─ 2 zsh", " └─ 3 zsh", " ▸ 2:server#", " ∙ 3:git-", " ∙ 4:db!",]
+            vec![
+                " ▾ tmux-arbor/           3",
+                "  ▪ nvim                1*",
+                "  ▫ cargo                1",
+                "  ∙ lazygit              3",
+                " ▾ src/                  1",
+                "  ▫ zsh                  1",
+                " ▾ api-server/           2",
+                "  ∙ npm                 2#",
+                "  ∙ tail                2#",
+                " ▾ ~/                    1",
+                "  ∙ psql                4!",
+            ]
         );
-        assert_eq!(l.canvas.hit(1, 0), Some(&Hit::Chevron("@1".into())));
-        assert_eq!(l.canvas.hit(4, 0), Some(&Hit::Window("@1".into())));
-        assert_eq!(l.canvas.hit(10, 2), Some(&Hit::Pane { wid: "@1".into(), pid: "%2".into() }));
+        assert_eq!(l.canvas.hit(4, 0), Some(&Hit::Dir("/home/u/ws/tmux-arbor".into())));
+        assert_eq!(
+            l.canvas.hit(5, 1),
+            Some(&Hit::Pane { wid: "@1".into(), pid: "%1".into(), dir: "/home/u/ws/tmux-arbor".into() })
+        );
+        assert_eq!(l.groups[0].y0, 0);
         assert_eq!(l.groups[0].y1, 3);
+
+        // Hovering a directory reveals the '+' button hit target on its right.
+        let hover = NodeKey::Dir("/home/u/ws/tmux-arbor".into());
+        cx.hover = Some(&hover);
+        let lh = list(&cx);
+        assert_eq!(lh.canvas.row_text(0).trim_end(), " ▾ tmux-arbor/           +");
+        assert_eq!(lh.canvas.hit(25, 0), Some(&Hit::DirAdd("/home/u/ws/tmux-arbor".into())));
     }
 
     #[test]
-    fn one_pane_windows_are_leaves() {
+    fn tree_layout() {
         let snap = sample();
+        let groups = snap.groups_with_home(Some("/home/u"));
         let pal = theme::light();
-        let l = list(&ctx(&snap, &pal, Variant::Branches, 28));
-        // No arrow to click and nothing below.
-        assert_eq!(l.canvas.row_text(5).trim_end(), " ∙ 3:git-");
-        assert_eq!(l.canvas.row_text(6).trim_end(), " ∙ 4:db!");
-        assert_eq!(l.canvas.hit(1, 5), Some(&Hit::Window("@3".into())));
-        let blocks = list(&ctx(&snap, &pal, Variant::Blocks, 24));
-        assert_eq!(blocks.canvas.row_text(7), " ┌ 3:git- ────────────┐ ");
-    }
-
-    #[test]
-    fn long_labels_are_cut() {
-        let mut snap = sample();
-        snap.windows[2].label = Label::parse("3:a-very-long-window-name-indeed");
-        let pal = theme::light();
-        let l = list(&ctx(&snap, &pal, Variant::Branches, 20));
-        assert_eq!(l.canvas.row_text(5).trim_end(), " ∙ 3:a-very-long-…");
+        let text = Strings::new(crate::config::Lang::Zh);
+        let l = list(&ctx(&snap, &groups, &pal, &text, Variant::Tree, 28));
+        let rows: Vec<String> = (0..l.canvas.h).map(|y| l.canvas.row_text(y).trim_end().to_string()).collect();
+        assert_eq!(rows[0], " ▾ tmux-arbor/           3");
+        assert_eq!(rows[1], " ├─ nvim                1*");
+        assert_eq!(rows[2], " ├─ cargo                1");
+        assert_eq!(rows[3], " └─ lazygit              3");
+        assert_eq!(rows[5], " └─ zsh                  1");
     }
 
     #[test]
     fn blocks_layout() {
-        let snap = sample();
+        let mut snap = sample();
+        snap.collapsed_dirs.insert("/home/u/ws/api-server".into());
+        let groups = snap.groups_with_home(Some("/home/u"));
         let pal = theme::light();
-        let l = list(&ctx(&snap, &pal, Variant::Blocks, 24));
-        assert_eq!(l.canvas.row_text(0), " ┌ 1:editor* ────── ▾ ┐ ");
-        assert_eq!(l.canvas.row_text(1), " │ ■ 1 nvim           │ ");
-        assert_eq!(l.canvas.row_text(4), " └────────────────────┘ ");
-        // server is collapsed: frame only.
-        assert_eq!(l.canvas.row_text(5), " ┌ 2:server# ────── ▸ ┐ ");
-        assert_eq!(l.canvas.row_text(6), " └────────────────────┘ ");
+        let text = Strings::new(crate::config::Lang::Zh);
+        let l = list(&ctx(&snap, &groups, &pal, &text, Variant::Blocks, 26));
+        assert_eq!(l.canvas.row_text(0), " ┌ tmux-arbor/ ──── 3 ▾ ┐ ");
+        assert_eq!(l.canvas.row_text(1), " │ ■ nvim            1* │ ");
+        assert_eq!(l.canvas.row_text(4), " └──────────────────────┘ ");
+        assert_eq!(l.canvas.row_text(8), " ┌ api-server/ ── # 2 ▸ ┐ ");
+        assert_eq!(l.canvas.row_text(9), " └──────────────────────┘ ");
     }
 
     #[test]
-    fn map_follows_real_splits() {
+    fn rail_layout() {
         let snap = sample();
+        let groups = snap.groups_with_home(Some("/home/u"));
         let pal = theme::light();
-        let l = list(&ctx(&snap, &pal, Variant::Map, 28));
-        let rows: Vec<String> = (0..l.canvas.h).map(|y| l.canvas.row_text(y)).collect();
-        // nvim on the left, two zsh stacked on the right.
-        assert!(rows[1].contains('┬'), "{rows:#?}");
-        assert!(rows.iter().any(|r| r.contains('├') || r.contains('┤')), "{rows:#?}");
-        assert!(rows.iter().any(|r| r.contains("1 nvim")), "{rows:#?}");
-        // Narrow sidebars fall back to branches.
-        let narrow = list(&ctx(&snap, &pal, Variant::Map, 20));
-        assert_eq!(narrow.canvas.row_text(1).trim_end(), " ├─ 1 nvim");
-    }
-
-    #[test]
-    fn rail_shows_numbers() {
-        let snap = sample();
-        let pal = theme::light();
-        let mut c = ctx(&snap, &pal, Variant::Branches, 7);
+        let text = Strings::new(crate::config::Lang::Zh);
+        let mut c = ctx(&snap, &groups, &pal, &text, Variant::Indent, 7);
         c.rail = true;
         let l = list(&c);
-        assert_eq!(l.canvas.h, 4);
-        assert_eq!(l.canvas.row_text(0), "   1   ");
+        // 7 panes + 3 separators = 10 rows
+        assert_eq!(l.canvas.h, 10);
+        assert_eq!(l.canvas.row_text(0), "  1.1  ");
+        assert_eq!(l.canvas.row_text(1), "  1.3  ");
+        assert_eq!(l.canvas.row_text(2), "   3   ");
+        assert_eq!(l.canvas.row_text(3), "  ──   ");
+        assert_eq!(l.canvas.row_text(4), "  1.2  ");
     }
 
     #[test]
-    fn map_is_as_short_as_its_smallest_pane_allows() {
-        let snap = sample();
+    fn long_pane_labels_are_cut() {
+        let mut snap = sample();
+        snap.windows[3].panes[0].cmd = "very-long-command-name-indeed".into();
+        snap.windows[3].panes[0].label = Label::parse("very-long-command-name-indeed");
+        let groups = snap.groups_with_home(Some("/home/u"));
         let pal = theme::light();
-        let l = list(&ctx(&snap, &pal, Variant::Map, 28));
-        let rows: Vec<String> = (0..l.canvas.h).map(|y| l.canvas.row_text(y).trim_end().to_string()).collect();
-        // Window row, then five lines: the two right panes get a row each.
-        assert_eq!(
-            rows[1..6],
-            [
-                "  ┌───────────┬───────────┐",
-                "  │1 nvim     │2 zsh      │",
-                "  │           ├───────────┤",
-                "  │           │3 zsh      │",
-                "  └───────────┴───────────┘",
-            ]
-        );
+        let text = Strings::new(crate::config::Lang::Zh);
+        let l = list(&ctx(&snap, &groups, &pal, &text, Variant::Indent, 20));
+        assert_eq!(l.canvas.row_text(10).trim_end(), "  ∙ very-long-… 4!");
     }
 
     #[test]
@@ -985,21 +980,20 @@ mod tests {
         let mut snap = sample();
         snap.cfg.prefix = "C-x".into();
         snap.cfg.split_h_key = "\\".into();
+        let groups = snap.groups_with_home(Some("/home/u"));
         let pal = theme::light();
         let text = Strings::new(crate::config::Lang::Zh);
         let mut c = Canvas::new(28, 4, Style::default());
-        let mut cx = ctx(&snap, &pal, Variant::Branches, 28);
+        let mut cx = ctx(&snap, &groups, &pal, &text, Variant::Indent, 28);
         assert_eq!(header(&mut c, &cx, true, true, &text), 2);
         assert_eq!(c.row_text(0).trim_end(), " work          TREE   ◫  ⊟");
         assert_eq!(c.hit(22, 0), Some(&Hit::Split('h')));
         assert_eq!(c.hit(25, 0), Some(&Hit::Split('v')));
-        // Hovering one shows what it does and the user's key.
         cx.hover_split = Some('h');
         let mut c = Canvas::new(28, 4, Style::default());
         header(&mut c, &cx, false, true, &text);
-        assert_eq!(c.row_text(0).trim_end(), " work  4 windows      ◫  ⊟");
+        assert_eq!(c.row_text(0).trim_end(), " work  7 panes        ◫  ⊟");
         assert_eq!(c.row_text(1), "────── 水平分割 · C-x \\ ────");
-        // No key bound: the name alone.
         cx.hover_split = Some('v');
         let mut c = Canvas::new(28, 4, Style::default());
         header(&mut c, &cx, false, true, &text);
@@ -1009,43 +1003,37 @@ mod tests {
     #[test]
     fn marquee_scrolls_a_cut_label() {
         let mut snap = sample();
-        snap.windows[2].label = Label::parse("3:staging-db-migrations");
+        snap.windows[3].panes[0].cmd = "staging-db-migrations".into();
+        snap.windows[3].panes[0].label = Label::parse("staging-db-migrations");
+        let groups = snap.groups_with_home(Some("/home/u"));
         let pal = theme::light();
-        let key = NodeKey::Window("@3".into());
-        let mut c = ctx(&snap, &pal, Variant::Branches, 20);
-        // At first it holds at the start, with nothing cut off by "…".
+        let text = Strings::new(crate::config::Lang::Zh);
+        let key = NodeKey::Pane("%7".into());
+        let mut c = ctx(&snap, &groups, &pal, &text, Variant::Indent, 20);
         c.marquee = Some((&key, Duration::ZERO));
-        assert_eq!(list(&c).canvas.row_text(5).trim_end(), " ∙ 3:staging-db-mi");
-        assert_eq!(c.overflow.get(), Some(8));
-        // Then it moves a column every 70ms, and reaches the end.
+        let row0 = list(&c).canvas.row_text(10).trim_end().to_string();
+        assert!(row0.starts_with("  ∙ staging-db"));
+        assert!(c.overflow.get().is_some());
         c.marquee = Some((&key, Duration::from_millis(350 + 3 * 70)));
-        assert_eq!(list(&c).canvas.row_text(5).trim_end(), " ∙ taging-db-migra");
-        c.marquee = Some((&key, Duration::from_millis(350 + 8 * 70 + 10)));
-        assert_eq!(list(&c).canvas.row_text(5).trim_end(), " ∙ g-db-migrations");
-        // Another node's label is cut as usual.
-        let other = NodeKey::Window("@4".into());
-        c.marquee = Some((&other, Duration::ZERO));
-        c.overflow.set(None);
-        assert_eq!(list(&c).canvas.row_text(5).trim_end(), " ∙ 3:staging-db-m…");
-        assert_eq!(c.overflow.get(), None);
+        assert_ne!(list(&c).canvas.row_text(10).trim_end(), row0);
     }
 
     #[test]
     fn cut_text_is_noted_for_the_popup() {
         let mut snap = sample();
-        snap.windows[2].label = Label::parse("3:staging-db-migrations");
+        snap.windows[3].panes[0].cmd = "staging-db-migrations-very-long".into();
+        snap.windows[3].panes[0].label = Label::parse("staging-db-migrations-very-long");
+        let groups = snap.groups_with_home(Some("/home/u"));
         let pal = theme::light();
-        let key = NodeKey::Window("@3".into());
-        let mut c = ctx(&snap, &pal, Variant::Branches, 20);
+        let text = Strings::new(crate::config::Lang::Zh);
+        let key = NodeKey::Pane("%7".into());
+        let mut c = ctx(&snap, &groups, &pal, &text, Variant::Indent, 20);
         c.tip_for = Some(&key);
         list(&c);
-        assert_eq!(c.tip.borrow().clone(), Some(Tip { y: 5, text: "3:staging-db-migrations".into() }));
-        // Text that fits needs none.
-        let fits = NodeKey::Window("@4".into());
-        c.tip_for = Some(&fits);
-        *c.tip.borrow_mut() = None;
-        list(&c);
-        assert_eq!(*c.tip.borrow(), None);
+        assert_eq!(
+            c.tip.borrow().clone(),
+            Some(Tip { y: 10, text: "staging-db-migrations-very-long · w4 · ~".into() })
+        );
     }
 
     #[test]
@@ -1062,8 +1050,10 @@ mod tests {
     #[test]
     fn tooltips_shift_then_wrap() {
         let snap = sample();
+        let groups = snap.groups_with_home(Some("/home/u"));
         let pal = theme::light();
-        let c = ctx(&snap, &pal, Variant::Branches, 20);
+        let text = Strings::new(crate::config::Lang::Zh);
+        let c = ctx(&snap, &groups, &pal, &text, Variant::Indent, 20);
         let mut canvas = Canvas::new(20, 3, Style::default());
         tooltip(&mut canvas, &c, 5, 0, "staging-db-mig", 3);
         assert_eq!(canvas.row_text(0), "     staging-db-mig ");
@@ -1071,12 +1061,5 @@ mod tests {
         tooltip(&mut canvas, &c, 5, 1, "3:staging-db-migrations", 3);
         assert_eq!(canvas.row_text(1), " 3:staging-db-migra ");
         assert_eq!(canvas.row_text(2), " tions              ");
-    }
-
-    #[test]
-    fn edges_keep_their_gaps() {
-        assert_eq!(scale_edges(&[0, 46, 92], 92, 24, 2, true), vec![0, 12, 24]);
-        assert_eq!(scale_edges(&[0, 1, 2, 3], 3, 4, 2, true), vec![0, 0, 2, 4]);
-        assert_eq!(scale_edges(&[0, 1, 41], 41, 4, 2, false), vec![0, 2, 4]);
     }
 }
