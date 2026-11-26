@@ -488,21 +488,89 @@ fn draw_rename_field(c: &mut Canvas<Hit>, ctx: &Ctx, r: &Rename, x_start: u16, y
     ctx.edit_cursor.set(Some((caret_x, y)));
 }
 
-fn dir_badges(g: &DirGroup) -> String {
+fn dir_badge_spans(ctx: &Ctx, g: &DirGroup, base: Style, sub: Color) -> Vec<(String, Style)> {
     if !g.collapsed {
-        return String::new();
+        return Vec::new();
     }
-    let mut b = String::new();
+    let key = NodeKey::Dir(g.raw_path.clone());
+    let on_cursor = ctx.is_cursor(&key);
+    let p = ctx.pal;
+    let status_st = |color: Color| {
+        if on_cursor { base.fg(p.cursor_fg).with(BOLD) } else { base.fg(color).with(BOLD) }
+    };
+    let mut spans = Vec::new();
     if g.has_focused {
-        b.push('*');
+        spans.push(("*".to_string(), base.fg(sub)));
     }
-    if g.has_activity {
-        b.push('#');
+    if let Some(sp) = g.working_spinner {
+        spans.push((sp.to_string(), status_st(p.status_working)));
     }
     if g.has_bell {
-        b.push('!');
+        spans.push(("!".to_string(), status_st(p.status_bell)));
     }
-    b
+    if g.has_activity {
+        spans.push(("#".to_string(), status_st(p.status_activity)));
+    }
+    spans
+}
+
+fn pane_indicator(
+    ctx: &Ctx,
+    it: &PaneItem,
+    look: &Look,
+    focused_glyph: &'static str,
+    idle_glyph: &'static str,
+) -> (String, Style) {
+    let pkey = NodeKey::Pane(it.pane.id.clone());
+    let on_cursor = ctx.is_cursor(&pkey);
+    let p = ctx.pal;
+    if it.is_bell() {
+        let st = if on_cursor { look.base.fg(p.cursor_fg).with(BOLD) } else { look.base.fg(p.status_bell).with(BOLD) };
+        return ("◆".to_string(), st);
+    }
+    if let Some(sp) = it.spinner() {
+        let st =
+            if on_cursor { look.base.fg(p.cursor_fg).with(BOLD) } else { look.base.fg(p.status_working).with(BOLD) };
+        return (sp.to_string(), st);
+    }
+    let glyph = if it.is_focused() {
+        focused_glyph
+    } else if it.is_win_sibling() {
+        "▫"
+    } else {
+        idle_glyph
+    };
+    let color = if on_cursor {
+        p.cursor_sub
+    } else if it.is_focused() {
+        p.cur_win_sub
+    } else if it.is_activity() {
+        p.status_activity
+    } else if it.is_win_sibling() {
+        p.dot_active
+    } else {
+        p.dot
+    };
+    let st = if !on_cursor && !it.is_focused() && it.is_activity() {
+        look.base.fg(color).with(BOLD)
+    } else {
+        look.base.fg(color)
+    };
+    (glyph.to_string(), st)
+}
+
+fn pane_badge_style(ctx: &Ctx, it: &PaneItem, look: &Look) -> Style {
+    let pkey = NodeKey::Pane(it.pane.id.clone());
+    if ctx.is_cursor(&pkey) {
+        return look.base.fg(look.sub);
+    }
+    if it.is_bell() {
+        look.base.fg(ctx.pal.status_bell).with(BOLD)
+    } else if it.is_activity() && !it.is_focused() {
+        look.base.fg(ctx.pal.status_activity).with(BOLD)
+    } else {
+        look.base.fg(look.sub)
+    }
 }
 
 fn group_height(ctx: &Ctx, g: &DirGroup) -> u16 {
@@ -612,13 +680,20 @@ fn draw_dir_row(c: &mut Canvas<Hit>, y: u16, ctx: &Ctx, g: &DirGroup, nodes: &mu
         c.put(add_x, y, " + ", add_st, end);
         add_x
     } else {
-        let badges = dir_badges(g);
+        let badges = dir_badge_spans(ctx, g, look.base, look.sub);
         let cnt = g.items.len().to_string();
-        let right_text = if badges.is_empty() { cnt } else { format!("{badges} {cnt}") };
-        let rw = width(&right_text) as u16;
+        let badges_w: u16 = badges.iter().map(|(t, _)| width(t) as u16).sum();
+        let rw = if badges.is_empty() { width(&cnt) as u16 } else { badges_w + 1 + width(&cnt) as u16 };
         if end > 5 + rw {
             let rx = end - rw - 1;
-            c.put(rx, y, &right_text, look.base.fg(look.sub), end);
+            let mut x = rx;
+            for (t, st) in &badges {
+                x = c.put(x, y, t, *st, end);
+            }
+            if !badges.is_empty() {
+                x = c.put(x, y, " ", look.base.fg(look.sub), end);
+            }
+            c.put(x, y, &cnt, look.base.fg(look.sub), end);
             rx
         } else {
             end
@@ -649,28 +724,23 @@ fn draw_pane_row(
 
     match ctx.variant {
         Variant::Tree => {
-            c.put(0, y, if is_last { " └─ " } else { " ├─ " }, guide_st, full);
+            if it.is_bell() {
+                c.put(0, y, if is_last { " └" } else { " ├" }, guide_st, full);
+                c.put(2, y, "◆", ctx.plain().fg(ctx.pal.status_bell).with(BOLD), full);
+                c.put(3, y, " ", guide_st, full);
+            } else if let Some(sp) = it.spinner() {
+                c.put(0, y, if is_last { " └" } else { " ├" }, guide_st, full);
+                c.put(2, y, &sp.to_string(), ctx.plain().fg(ctx.pal.status_working).with(BOLD), full);
+                c.put(3, y, " ", guide_st, full);
+            } else {
+                c.put(0, y, if is_last { " └─ " } else { " ├─ " }, guide_st, full);
+            }
             c.fill(4, end, y, look.base);
         }
         _ => {
             c.fill(2, end, y, look.base);
-            let ind = if it.is_focused() {
-                "▪"
-            } else if it.is_win_sibling() {
-                "▫"
-            } else {
-                LEAF
-            };
-            let ind_color = if ctx.is_cursor(&NodeKey::Pane(it.pane.id.clone())) {
-                ctx.pal.cursor_sub
-            } else if it.is_focused() {
-                ctx.pal.cur_win_sub
-            } else if it.is_win_sibling() {
-                ctx.pal.dot_active
-            } else {
-                ctx.pal.dot
-            };
-            c.put(2, y, ind, look.base.fg(ind_color), end);
+            let (ind, ind_st) = pane_indicator(ctx, it, &look, "▪", LEAF);
+            c.put(2, y, &ind, ind_st, end);
         }
     }
 
@@ -697,7 +767,7 @@ fn draw_pane_row(
         let bw = width(&badge) as u16;
         if end > 6 + bw {
             let bx = end - bw - 1;
-            c.put(bx, y, &badge, look.base.fg(look.sub), end);
+            c.put(bx, y, &badge, pane_badge_style(ctx, it, &look), end);
             bx.saturating_sub(1)
         } else {
             end
@@ -788,13 +858,22 @@ fn draw_dir_block(c: &mut Canvas<Hit>, y0: u16, ctx: &Ctx, g: &DirGroup, nodes: 
         c.set_hit(add_x, x1 - 2, y0, &Hit::DirAdd(g.raw_path.clone()));
         add_x
     } else {
-        let badges = dir_badges(g);
+        let base_st = frame.fg(if g.collapsed && g.has_focused { p.cur_win_sub } else { p.muted });
+        let badges = dir_badge_spans(ctx, g, frame, base_st.fg);
         let cnt = g.items.len();
-        let right_str = if badges.is_empty() { format!(" {cnt} {chev} ") } else { format!(" {badges} {cnt} {chev} ") };
-        let rw = width(&right_str) as u16;
+        let tail = format!(" {cnt} {chev} ");
+        let badges_w: u16 = badges.iter().map(|(t, _)| width(t) as u16).sum();
+        let rw = if badges.is_empty() { width(&tail) as u16 } else { 1 + badges_w + width(&tail) as u16 };
         if x1 > x0 + rw + 4 {
             let rx = x1 - rw;
-            c.put(rx, y0, &right_str, frame.fg(if g.collapsed && g.has_focused { p.cur_win_sub } else { p.muted }), x1);
+            let mut x = rx;
+            if !badges.is_empty() {
+                x = c.put(x, y0, " ", base_st, x1);
+                for (t, st) in &badges {
+                    x = c.put(x, y0, t, *st, x1);
+                }
+            }
+            c.put(x, y0, &tail, base_st, x1);
             rx
         } else {
             x1
@@ -814,23 +893,8 @@ fn draw_dir_block(c: &mut Canvas<Hit>, y0: u16, ctx: &Ctx, g: &DirGroup, nodes: 
         let look = ctx.pane_look(it);
         c.fill(x0 + 1, x1, y, look.base);
         let pkey = NodeKey::Pane(it.pane.id.clone());
-        let dot_color = if ctx.is_cursor(&pkey) {
-            p.cursor_fg
-        } else if it.is_focused() {
-            p.cur_win_sub
-        } else if it.is_win_sibling() {
-            p.dot_active
-        } else {
-            p.dot
-        };
-        let ind = if it.is_focused() {
-            "■"
-        } else if it.is_win_sibling() {
-            "▫"
-        } else {
-            "□"
-        };
-        c.put(x0 + 2, y, ind, look.base.fg(dot_color), x1);
+        let (ind, ind_st) = pane_indicator(ctx, it, &look, "■", "□");
+        c.put(x0 + 2, y, &ind, ind_st, x1);
 
         if let Some(r) = ctx.rename.filter(|r| r.pid == it.pane.id) {
             draw_rename_field(c, ctx, r, x0 + 4, y, x1);
@@ -854,7 +918,7 @@ fn draw_dir_block(c: &mut Canvas<Hit>, y0: u16, ctx: &Ctx, g: &DirGroup, nodes: 
             let bw = width(&badge) as u16;
             if x1 > x0 + 6 + bw {
                 let bx = x1 - bw - 1;
-                c.put(bx, y, &badge, look.base.fg(look.sub), x1);
+                c.put(bx, y, &badge, pane_badge_style(ctx, it, &look), x1);
                 bx.saturating_sub(1)
             } else {
                 x1.saturating_sub(1)
@@ -870,25 +934,41 @@ fn draw_dir_block(c: &mut Canvas<Hit>, y0: u16, ctx: &Ctx, g: &DirGroup, nodes: 
 }
 
 fn draw_rail_group(c: &mut Canvas<Hit>, y0: u16, ctx: &Ctx, g: &DirGroup, nodes: &mut Vec<(NodeKey, u16, u16)>) {
+    let p = ctx.pal;
     for (i, it) in g.items.iter().enumerate() {
         let y = y0 + i as u16;
         let look = ctx.pane_look(it);
+        let key = NodeKey::Pane(it.pane.id.clone());
+        let on_cursor = ctx.is_cursor(&key);
         let text = it.rail_label();
-        let tw = width(&text) as u16;
+        let status = if it.is_bell() {
+            Some(("!".to_string(), if on_cursor { p.cursor_fg } else { p.status_bell }))
+        } else if let Some(sp) = it.spinner() {
+            Some((sp.to_string(), if on_cursor { p.cursor_fg } else { p.status_working }))
+        } else if it.is_activity() && !it.is_focused() {
+            Some(("#".to_string(), if on_cursor { p.cursor_fg } else { p.status_activity }))
+        } else {
+            None
+        };
+        let sw = status.as_ref().map_or(0, |(s, _)| width(s) as u16);
+        let tw = width(&text) as u16 + sw;
         let mut bw = (tw + 2).max(4).min(ctx.width);
         if (ctx.width - bw) % 2 == 1 && bw < ctx.width {
             bw += 1;
         }
         let x = (ctx.width - bw) / 2;
         c.fill(x, x + bw, y, look.base);
-        c.put(x + (bw - tw) / 2, y, &text, look.base, x + bw);
+        let tx = x + bw.saturating_sub(tw) / 2;
+        let tx = c.put(tx, y, &text, look.base, x + bw);
+        if let Some((sym, col)) = status {
+            c.put(tx, y, &sym, look.base.fg(col).with(BOLD), x + bw);
+        }
         c.set_hit(
             0,
             ctx.width,
             y,
             &Hit::Pane { wid: it.wid.clone(), pid: it.pane.id.clone(), dir: g.raw_path.clone() },
         );
-        let key = NodeKey::Pane(it.pane.id.clone());
         let tip_text = format!("{} · {} (w{})", g.label, it.pane.cmd, it.win_index);
         ctx.note_tip(&key, y, || tip_text, 100, 0, true);
         nodes.push((key, y, y));
@@ -1104,7 +1184,7 @@ mod tests {
                 "  ∙ npm                 2#",
                 "  ∙ tail                2#",
                 " ▾ ~/                    1",
-                "  ∙ psql                4!",
+                "  ◆ psql                4!",
             ]
         );
         assert_eq!(l.canvas.hit(4, 0), Some(&Hit::Dir("/home/u/ws/tmux-arbor".into())));
@@ -1180,7 +1260,7 @@ mod tests {
         let pal = theme::light();
         let text = Strings::new(crate::config::Lang::Zh);
         let l = list(&ctx(&snap, &groups, &pal, &text, Variant::Indent, 20));
-        assert_eq!(l.canvas.row_text(10).trim_end(), "  ∙ very-long-… 4!");
+        assert_eq!(l.canvas.row_text(10).trim_end(), "  ◆ very-long-… 4!");
     }
 
     #[test]
@@ -1220,7 +1300,7 @@ mod tests {
         let mut c = ctx(&snap, &groups, &pal, &text, Variant::Indent, 20);
         c.marquee = Some((&key, Duration::ZERO));
         let row0 = list(&c).canvas.row_text(10).trim_end().to_string();
-        assert!(row0.starts_with("  ∙ staging-db"));
+        assert!(row0.starts_with("  ◆ staging-db"));
         assert!(c.overflow.get().is_some());
         c.marquee = Some((&key, Duration::from_millis(350 + 3 * 70)));
         assert_ne!(list(&c).canvas.row_text(10).trim_end(), row0);
@@ -1321,5 +1401,41 @@ mod tests {
         let le = list(&cx);
         assert_eq!(le.canvas.row_text(1).trim_end(), "  ▪ 排查");
         assert_eq!(cx.edit_cursor.get(), Some((8, 1)));
+    }
+
+    #[test]
+    fn scheme_a_renders_working_spinner_and_collapsed_dir_status() {
+        let mut snap = sample();
+        snap.windows[0].panes[0].spinner = Some('⠐');
+        snap.windows[3].panes[0].spinner = Some('⠋');
+        let groups = snap.groups_with_home(Some("/home/u"));
+        let pal = theme::dark();
+        let text = Strings::new(crate::config::Lang::Zh);
+
+        // Indent: working pane shows spinner; bell takes precedence over spinner on %7.
+        let l = list(&ctx(&snap, &groups, &pal, &text, Variant::Indent, 28));
+        assert_eq!(l.canvas.row_text(1).trim_end(), "  ⠐ nvim                1*");
+        assert_eq!(l.canvas.row_text(10).trim_end(), "  ◆ psql                4!");
+
+        // Tree: branch glyph integrates spinner / bell diamond.
+        let lt = list(&ctx(&snap, &groups, &pal, &text, Variant::Tree, 28));
+        assert_eq!(lt.canvas.row_text(1).trim_end(), " ├⠐ nvim                1*");
+        assert_eq!(lt.canvas.row_text(10).trim_end(), " └◆ psql                4!");
+
+        // Collapsed directory bubbles up focused, spinner, bell, and activity.
+        snap.collapsed_dirs.insert("/home/u/ws/tmux-arbor".into());
+        snap.collapsed_dirs.insert("/home/u".into());
+        let groups = snap.groups_with_home(Some("/home/u"));
+        let lc = list(&ctx(&snap, &groups, &pal, &text, Variant::Indent, 28));
+        assert_eq!(lc.canvas.row_text(0).trim_end(), " ▸ tmux-arbor/        *⠐ 3");
+        let last_y = lc.canvas.h - 1;
+        assert_eq!(lc.canvas.row_text(last_y).trim_end(), " ▸ ~/                 ⠋! 1");
+
+        // Rail mode displays spinner / bell / activity inline.
+        let mut rc = ctx(&snap, &groups, &pal, &text, Variant::Indent, 7);
+        rc.rail = true;
+        let lr = list(&rc);
+        assert_eq!(lr.canvas.row_text(0), " 1.1⠐  ");
+        assert_eq!(lr.canvas.row_text(lr.canvas.h - 1), "  4!   ");
     }
 }

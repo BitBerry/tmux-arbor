@@ -34,6 +34,9 @@ pub struct Palette {
     pub dot_active: Color,
     pub dir_bg: Color,
     pub dir_fg: Color,
+    pub status_working: Color,
+    pub status_bell: Color,
+    pub status_activity: Color,
 }
 
 const fn rgb(hex: u32) -> Color {
@@ -88,6 +91,9 @@ pub fn light() -> Palette {
         dot_active: A600,
         dir_bg: rgb(0xe8eef4),
         dir_fg: A700,
+        status_working: rgb(0x0b72b9),
+        status_bell: rgb(0xc86414),
+        status_activity: rgb(0x1f8a66),
     }
 }
 
@@ -121,6 +127,9 @@ pub fn dark() -> Palette {
         dot_active: A500,
         dir_bg: rgb(0x252c37),
         dir_fg: A300,
+        status_working: rgb(0x66c2ff),
+        status_bell: rgb(0xf2a65a),
+        status_activity: rgb(0x68c2a3),
     }
 }
 

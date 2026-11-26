@@ -1261,6 +1261,11 @@ impl App {
         let focused = self.focused();
         self.pick_marquee(focused);
         let Some(snap) = &self.snap else { return };
+        // Never write to a sidebar pane in a hidden/background window: doing so
+        // would falsely trip tmux `monitor-activity` on every background window.
+        if !snap.visible() {
+            return;
+        }
         let (w, h) = self.size;
         if w == 0 || h == 0 {
             return;

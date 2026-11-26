@@ -31,6 +31,8 @@ pub struct PaneInfo {
     pub auto_cmd: String,
     pub custom_name: Option<String>,
     pub label: Label,
+    /// Live Braille spinner glyph extracted from `pane_title` (e.g. Claude Code working).
+    pub spinner: Option<char>,
     pub cwd: String,
     pub git_root: Option<String>,
 }
@@ -82,13 +84,25 @@ impl PaneItem {
         self.win_active && !self.pane.active
     }
 
+    pub fn is_bell(&self) -> bool {
+        self.win_flags.contains('!')
+    }
+
+    pub fn is_activity(&self) -> bool {
+        self.win_flags.contains('#')
+    }
+
+    pub fn spinner(&self) -> Option<char> {
+        self.pane.spinner
+    }
+
     pub fn badge(&self) -> String {
-        if self.is_focused() {
-            format!("{}*", self.win_index)
-        } else if self.win_flags.contains('#') {
-            format!("{}#", self.win_index)
-        } else if self.win_flags.contains('!') {
+        if self.is_bell() {
             format!("{}!", self.win_index)
+        } else if self.is_focused() {
+            format!("{}*", self.win_index)
+        } else if self.is_activity() {
+            format!("{}#", self.win_index)
         } else {
             self.win_index.to_string()
         }
@@ -139,6 +153,7 @@ pub struct DirGroup {
     pub has_focused: bool,
     pub has_activity: bool,
     pub has_bell: bool,
+    pub working_spinner: Option<char>,
     pub items: Vec<PaneItem>,
 }
 
@@ -175,6 +190,13 @@ fn join(fields: &[&str]) -> String {
 /// Pane rows show the running command unless @arbor-pane-format says
 /// otherwise (say, a Claude session's name from the pane title).
 const PANE_LABEL: &str = "#{?#{@arbor-pane-format},#{E:@arbor-pane-format},#{pane_current_command}}";
+
+/// Extracts a leading non-blank Braille spinner character from a pane title
+/// (used by Claude Code and similar CLIs in OSC 0/2 titles while working).
+pub fn extract_spinner(title: &str) -> Option<char> {
+    let ch = title.trim_start().chars().next()?;
+    matches!(ch, '\u{2801}'..='\u{28ff}').then_some(ch)
+}
 
 pub fn home_dir() -> Option<&'static str> {
     static HOME: OnceLock<Option<String>> = OnceLock::new();
@@ -345,6 +367,7 @@ impl Snapshot {
             crate::tip::KIND,
             "#{pane_current_path}",
             "#{@arbor-name}",
+            "#{pane_title}",
             PANE_LABEL,
         ]);
         let out = tmux::Batch::new()
@@ -424,12 +447,13 @@ impl Snapshot {
                     });
                 }
                 "P" => {
-                    let f: Vec<&str> = rest.splitn(8, SEP).collect();
-                    if f.len() < 8 {
+                    let f: Vec<&str> = rest.splitn(9, SEP).collect();
+                    if f.len() < 9 {
                         continue;
                     }
                     let custom_name = (!f[6].trim().is_empty()).then(|| f[6].trim().to_string());
-                    let label = Label::parse(f[7]);
+                    let spinner = extract_spinner(f[7]);
+                    let label = Label::parse(f[8]);
                     let auto_cmd = label.plain();
                     let cmd = custom_name.clone().unwrap_or_else(|| auto_cmd.clone());
                     let info = PaneInfo {
@@ -440,6 +464,7 @@ impl Snapshot {
                         auto_cmd,
                         custom_name,
                         label,
+                        spinner,
                         cwd: normalize_path(f[5]),
                         git_root: None,
                     };
@@ -543,6 +568,7 @@ impl Snapshot {
             has_focused: bool,
             has_activity: bool,
             has_bell: bool,
+            working_spinner: Option<char>,
             items: Vec<PaneItem>,
         }
         let mut by_dir: HashMap<String, Acc> = HashMap::new();
@@ -562,6 +588,7 @@ impl Snapshot {
                         has_focused: false,
                         has_activity: false,
                         has_bell: false,
+                        working_spinner: None,
                         items: Vec::new(),
                     }
                 });
@@ -574,6 +601,9 @@ impl Snapshot {
                 }
                 if w.flags.contains('!') {
                     acc.has_bell = true;
+                }
+                if acc.working_spinner.is_none() && p.spinner.is_some() {
+                    acc.working_spinner = p.spinner;
                 }
                 acc.items.push(PaneItem {
                     wid: w.id.clone(),
@@ -605,6 +635,7 @@ impl Snapshot {
                     has_focused: acc.has_focused,
                     has_activity: acc.has_activity,
                     has_bell: acc.has_bell,
+                    working_spinner: acc.working_spinner,
                     items: acc.items,
                 })
             })
@@ -660,17 +691,17 @@ pub mod tests {
         out += &format!("W{s}@2{s}2{s}0{s}#{s}server\n");
         out += &format!("W{s}@3{s}3{s}0{s}-{s}git\n");
         out += &format!("W{s}@4{s}4{s}0{s}!{s}db\n");
-        for (w, p, active, last, sb, cwd, custom, cmd) in [
-            ("@1", "%0", 0, 0, "1", "/home/u/ws/tmux-arbor", "", "arbor"),
-            ("@1", "%1", 1, 0, "", "/home/u/ws/tmux-arbor", "", "nvim"),
-            ("@1", "%2", 0, 1, "", "/home/u/ws/tmux-arbor/src", "", "zsh"),
-            ("@1", "%3", 0, 0, "", "/home/u/ws/tmux-arbor", "", "cargo"),
-            ("@2", "%4", 1, 0, "", "/home/u/ws/api-server", "", "npm"),
-            ("@2", "%5", 0, 0, "", "/home/u/ws/api-server", "", "tail"),
-            ("@3", "%6", 1, 0, "", "/home/u/ws/tmux-arbor", "", "lazygit"),
-            ("@4", "%7", 1, 0, "", "/home/u", "", "psql"),
+        for (w, p, active, last, sb, cwd, custom, title, cmd) in [
+            ("@1", "%0", 0, 0, "1", "/home/u/ws/tmux-arbor", "", "arbor", "arbor"),
+            ("@1", "%1", 1, 0, "", "/home/u/ws/tmux-arbor", "", "nvim", "nvim"),
+            ("@1", "%2", 0, 1, "", "/home/u/ws/tmux-arbor/src", "", "zsh", "zsh"),
+            ("@1", "%3", 0, 0, "", "/home/u/ws/tmux-arbor", "", "cargo", "cargo"),
+            ("@2", "%4", 1, 0, "", "/home/u/ws/api-server", "", "npm", "npm"),
+            ("@2", "%5", 0, 0, "", "/home/u/ws/api-server", "", "tail", "tail"),
+            ("@3", "%6", 1, 0, "", "/home/u/ws/tmux-arbor", "", "lazygit", "lazygit"),
+            ("@4", "%7", 1, 0, "", "/home/u", "", "psql", "psql"),
         ] {
-            out += &format!("P{s}{w}{s}{p}{s}{active}{s}{last}{s}{sb}{s}{cwd}{s}{custom}{s}{cmd}\n");
+            out += &format!("P{s}{w}{s}{p}{s}{active}{s}{last}{s}{sb}{s}{cwd}{s}{custom}{s}{title}{s}{cmd}\n");
         }
         Snapshot::parse(&out).unwrap()
     }
@@ -778,13 +809,24 @@ pub mod tests {
         out += &format!("S{s}$1{s}work{s}@1{s}0{s}1{s}1{s}28{s}120{s}1{s}0{s}1{s}1{s}0{s}0{s}0{s}0{s}\n");
         out += &format!("O{s}\n");
         out += &format!("W{s}@1{s}1{s}1{s}*{s}agy\n");
-        out += &format!("P{s}@1{s}%1{s}1{s}0{s}{s}/home/u/ws/xray-manager{s}防火墙排查{s}agy\n");
+        out += &format!("P{s}@1{s}%1{s}1{s}0{s}{s}/home/u/ws/xray-manager{s}防火墙排查{s}⠐ Claude session{s}agy\n");
         let snap = Snapshot::parse(&out).unwrap();
         let groups = snap.groups_with_home(Some("/home/u"));
         let item = &groups[0].items[0];
         assert_eq!(item.pane.cmd, "防火墙排查");
         assert_eq!(item.pane.auto_cmd, "agy");
         assert_eq!(item.pane.custom_name.as_deref(), Some("防火墙排查"));
+        assert_eq!(item.pane.spinner, Some('⠐'));
+        assert_eq!(groups[0].working_spinner, Some('⠐'));
         assert_eq!(item.tooltip(Some("/home/u")), "防火墙排查 (agy) · w1 · ~/ws/xray-manager");
+    }
+
+    #[test]
+    fn extracts_braille_spinner_from_pane_title() {
+        assert_eq!(extract_spinner("⠐ Triton 设计"), Some('⠐'));
+        assert_eq!(extract_spinner(" ⠋ building"), Some('⠋'));
+        assert_eq!(extract_spinner("✳ slack-tasks"), None);
+        assert_eq!(extract_spinner("\u{2800} blank"), None);
+        assert_eq!(extract_spinner(""), None);
     }
 }
